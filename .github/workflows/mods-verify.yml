@@ -1,0 +1,65 @@
+name: Mods · Verify
+
+# Typechecks, tests and lints what the mod stack touches (mods/scripts/verify.mjs).
+
+on:
+  push:
+    branches: [main, next, "repair/**", "mod/**"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Ref to verify
+        default: main
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mods-verify-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify mod stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          REF: ${{ inputs.ref || github.sha }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=blob:none --no-tags origin "$REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout -q --detach FETCH_HEAD
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install dependencies
+        run: vp install --filter=@t3tools/web... --filter=t3... --filter=@t3tools/desktop...
+
+      - name: Verify
+        run: node mods/scripts/verify.mjs
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mods-verify-report
+          path: mods/verify-report.md
+          if-no-files-found: ignore
