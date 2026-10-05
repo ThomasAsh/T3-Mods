@@ -1,6 +1,6 @@
 # T3-Mods
 
-Personal mods for [T3 Code](https://github.com/pingdotgg/t3code). An automated pipeline keeps them on top of each upstream stable release.
+Personal mods for [T3 Code](https://github.com/pingdotgg/t3code). An automated pipeline keeps them on top of each upstream release.
 
 Design and decisions: [PLAN.md](PLAN.md).
 
@@ -8,7 +8,7 @@ Design and decisions: [PLAN.md](PLAN.md).
 
 | Branch | Contents |
 |---|---|
-| `main` | Latest upstream stable tag plus the mod stack. This is what gets built and installed. The pipeline rebases it, so history is rewritten. |
+| `main` | Latest upstream release on the followed channel, plus the mod stack. This is what gets built and installed. The pipeline rebases it, so history is rewritten. |
 | `next` | Upstream `main` plus the mod stack. A canary: breakage and ports show up here before the next stable release. |
 | `repair/*` | Automated repair attempts, merged once they pass verification. |
 
@@ -27,10 +27,12 @@ Each mod is one commit on top of the upstream tag, kept in the order of [`mods.j
 
 | Workflow | When | What |
 |---|---|---|
-| `mods-sync` (stable) | Hourly | Detects a new upstream stable tag, rebases `main`, verifies, repairs with Claude Code if needed, then builds and publishes |
-| `mods-sync` (canary) | Daily | Same against upstream `main`, pushed to `next`; never publishes |
+| `mods-sync` (release) | Hourly for stable, daily for nightly | Detects a new upstream tag on the followed channel, rebases `main`, verifies, repairs with Claude Code if needed, then builds and publishes |
+| `mods-sync` (canary) | Daily, while following stable | Same against upstream `main`, pushed to `next`; never publishes |
 | `mods-verify` | Push to `main`, `next`, `mod/**`, `repair/**` | Typecheck, tests and lint for what the stack touches |
 | `mods-build` | On demand or from sync | Windows x64 installer, published as a private release |
+
+The channel is set in [`mods.json`](mods.json) under `upstream`. With `"channel": "nightly"` and `"stableFrom": "0.0.46"`, the stack follows nightlies until v0.0.46 stable is out, then switches to stable releases by itself.
 
 `next` is derived from `main`. The tag `mods-next-source` records which `main` commit it was built from. A stable sync reuses `next` (and the ports already done there) only while `main` is unchanged and `next`'s upstream base is part of the new release. Otherwise it rebases `main`.
 
