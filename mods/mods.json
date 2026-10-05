@@ -1,4 +1,8 @@
 {
+  "upstream": {
+    "channel": "nightly",
+    "stableFrom": "0.0.46"
+  },
   "mods": [
     {
       "id": "fork-hygiene",
