@@ -624,6 +624,8 @@ const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_MODELS: ServerProvider["models"] = [];
 const EMPTY_USAGE_LIMIT_SOURCES: UsageLimitSourceSnapshots = [];
 import type { CodexArtifactTemplate } from "@t3tools/shared/codexArtifactTemplates";
+import { useRoutedComposerInstance } from "~/mods/accountRouter/useRoutedComposerInstance";
+import { routedPreviewSelection } from "~/mods/accountRouter/routedComposerInstance"; // t3-mods: account-router
 
 const TIMELINE_SCROLL_CANCEL_SENTINEL = Object.freeze({});
 const EMPTY_FEEDBACK_SUBMISSIONS: ReadonlyArray<CodexFeedbackSubmission> = [];
@@ -2991,7 +2993,12 @@ export default function ChatView(props: ChatViewProps) {
     ? (activeEnvironment?.serverConfig ?? null)
     : (primaryEnvironment?.serverConfig ?? null);
   const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
-  const selectedProviderByThreadId = composerActiveProvider ?? null;
+  // t3-mods: account-router — a pick of an account the thread left follows the thread.
+  const selectedProviderByThreadId = useRoutedComposerInstance(
+    environmentId,
+    activeThread,
+    composerActiveProvider ?? null,
+  );
   const threadProvider =
     activeThread?.modelSelection.instanceId ??
     activeProjectDefaultModelSelection?.instanceId ??
@@ -7329,12 +7336,15 @@ export default function ChatView(props: ChatViewProps) {
     () =>
       resolvePendingHandoff(
         serverProjection,
-        composerSelectedModelSelection ?? activeThread?.modelSelection,
+        // t3-mods: account-router — preview the account the composer sends, not a pick the thread left.
+        routedPreviewSelection(composerSelectedModelSelection, selectedProviderByThreadId) ??
+          activeThread?.modelSelection,
         providerStatuses,
       ),
     [
       serverProjection,
       composerSelectedModelSelection,
+      selectedProviderByThreadId, // t3-mods: account-router
       activeThread?.modelSelection,
       providerStatuses,
     ],
