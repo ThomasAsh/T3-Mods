@@ -158,7 +158,7 @@ jobs:
 
       - name: Install dependencies
         if: steps.rebase.outputs.status != 'up-to-date' || inputs.force
-        run: vp install --filter=@t3tools/web... --filter=t3... --filter=@t3tools/desktop... --filter=@t3tools/oxlint-plugin-t3code...
+        run: vp install --filter=@t3tools/web... --filter=t3... --filter=@t3tools/desktop... --filter=@t3tools/oxlint-plugin-t3code... --filter=@t3tools/scripts...
 
       - name: Verify (with repair)
         id: verify
