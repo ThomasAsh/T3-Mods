@@ -51,6 +51,7 @@ import { layer as threadLifecycleServiceLayer } from "./ThreadLifecycleService.t
 import { layer as threadForkServiceLayer } from "./ThreadForkService.ts";
 import { layer as turnItemPositionStoreLayer } from "./TurnItemPositionStore.ts";
 import { layer as scheduledTaskServiceLayer } from "../scheduledTasks/ScheduledTaskService.ts";
+import { withAccountRouter } from "../mods/accountRouter/AccountRouter.ts"; // t3-mods: account-router
 
 /** The shared application event log and its command receipts. */
 export const OrchestrationEventInfrastructureLayerLive = Layer.mergeAll(
@@ -194,7 +195,8 @@ const runFinalizationServiceProvided = runFinalizationServiceLayer.pipe(
   Layer.provide(Layer.merge(checkpointCaptureServiceProvided, projectionStoreLayer)),
 );
 
-const orchestratorProvided = orchestratorLayer.pipe(
+// t3-mods: account-router. Every dispatch passes the account router first.
+const orchestratorProvided = withAccountRouter(orchestratorLayer).pipe(
   Layer.provide(
     Layer.mergeAll(
       checkpointServiceProvided,
