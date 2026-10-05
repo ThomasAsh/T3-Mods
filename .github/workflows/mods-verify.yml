@@ -51,7 +51,7 @@ jobs:
           run-install: false
 
       - name: Install dependencies
-        run: vp install --filter=@t3tools/web... --filter=t3... --filter=@t3tools/desktop...
+        run: vp install --filter=@t3tools/web... --filter=t3... --filter=@t3tools/desktop... --filter=@t3tools/oxlint-plugin-t3code...
 
       - name: Verify
         run: node mods/scripts/verify.mjs
