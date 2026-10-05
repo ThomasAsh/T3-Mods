@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Replays the mod stack onto a new upstream commit.
 //
-//   node mods/scripts/sync.mjs --target <stable tag | "main"> [--prefer next]
+//   node mods/scripts/sync.mjs --target <release tag | "main"> [--prefer next]
 //
 // The stack is every commit on a branch that upstream cannot reach; its base is the
 // parent of the oldest one. Sources are tried in order: `next` (the canary, which may
@@ -44,14 +44,19 @@ function parseArgs() {
   return { target, prefer: value("--prefer") ?? "next" };
 }
 
-/** Fetches upstream main and stable tags into their own namespaces (no clash with mods-* tags). */
-function fetchUpstream() {
+/**
+ * Fetches upstream main, the stable tags and the target tag (a nightly target is not in
+ * the stable list) into their own namespaces, so they never clash with mods-* tags.
+ */
+function fetchUpstream(target) {
   const stable = JSON.parse(
     run("node", [upstreamScript, "list"], { stdio: ["ignore", "pipe", "inherit"] }),
   );
+  const tags = new Set(stable.map((entry) => entry.tag));
+  if (target !== "main") tags.add(target);
   const refspecs = [
     "+refs/heads/main:refs/remotes/upstream/main",
-    ...stable.map((entry) => `+refs/tags/${entry.tag}:refs/upstream-tags/${entry.tag}`),
+    ...[...tags].map((tag) => `+refs/tags/${tag}:refs/upstream-tags/${tag}`),
   ];
   git("fetch", "--quiet", "--filter=blob:none", "--no-tags", UPSTREAM_URL, ...refspecs);
 }
@@ -115,7 +120,7 @@ function continueRebase() {
 
 function main() {
   const { target, prefer } = parseArgs();
-  fetchUpstream();
+  fetchUpstream(target);
   const targetSha =
     target === "main"
       ? git("rev-parse", "refs/remotes/upstream/main")
