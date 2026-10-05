@@ -34,7 +34,6 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Join-Path $env:LOCALAPPDATA "T3ModsUpdater"
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\t3code"
-$AppExe = Join-Path $InstallDir "T3 Code (Alpha).exe"
 $UserData = Join-Path $env:USERPROFILE ".t3\userdata"
 $StatePath = Join-Path $Root "state.json"
 $LogPath = Join-Path $Root "updater.log"
@@ -98,6 +97,14 @@ function Show-Toast([string]$Title, [string]$Body) {
   } catch {
     Write-Log "toast failed: $($_.Exception.Message)"
   }
+}
+
+# The exe is named after the product, which differs by channel ("T3 Code (Nightly).exe").
+function Get-AppExe {
+  $exe = Get-ChildItem $InstallDir -Filter "T3 Code*.exe" -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -notlike "Uninstall*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  if (-not $exe) { throw "no T3 Code executable in $InstallDir" }
+  return $exe.FullName
 }
 
 function Test-VanillaInstall {
@@ -233,7 +240,7 @@ function Install-Build($Release) {
   $process = Start-Process -FilePath $Release.Installer -ArgumentList "/S" -Wait -PassThru
   if ($process.ExitCode -ne 0) { throw "installer exited with $($process.ExitCode)" }
   if (Test-VanillaInstall) { throw "installed build still carries an update feed" }
-  Start-Process -FilePath $AppExe | Out-Null
+  Start-Process -FilePath (Get-AppExe) | Out-Null
   return Test-Health $installStartedUtc
 }
 
