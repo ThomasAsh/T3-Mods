@@ -1,0 +1,231 @@
+name: Mods · Sync upstream
+
+# Keeps the mod stack on top of upstream (mods/scripts/sync.mjs):
+#   stable  hourly: a new upstream release tag → rebase main, verify, repair, build, publish
+#   canary  daily:  upstream main → rebase onto `next`, verify, repair; never publishes
+# Repairs run Claude Code headless (mods/scripts/repair.sh) when CLAUDE_CODE_OAUTH_TOKEN
+# is set. If a stack can't be verified, nothing is pushed to main and an issue is opened.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+    - cron: "41 19 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "stable: latest release tag onto main · canary: upstream main onto next"
+        type: choice
+        options: [stable, canary]
+        default: stable
+      force:
+        description: Rebuild and publish even when main is already on the latest tag
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+  actions: read
+
+concurrency:
+  group: mods-sync
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      target: ${{ steps.plan.outputs.target }}
+      needed: ${{ steps.plan.outputs.needed }}
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=tree:0 --no-tags origin main
+          git sparse-checkout set --no-cone '/mods/'
+          git checkout -q --detach FETCH_HEAD
+
+      - name: Plan
+        id: plan
+        shell: bash
+        env:
+          INPUT_MODE: ${{ inputs.mode }}
+          FORCE: ${{ inputs.force }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+          mode="${INPUT_MODE:-stable}"
+          [ "$SCHEDULE" = "41 19 * * *" ] && mode=canary
+          if [ "$mode" = "canary" ]; then
+            target=main
+            needed=true
+          else
+            target="$(node mods/scripts/upstream.mjs latest)"
+            base="$(node mods/scripts/upstream.mjs base)"
+            needed=false
+            if [ "$target" != "$base" ] || [ "$FORCE" = "true" ]; then needed=true; fi
+            echo "main is on $base; latest upstream release is $target"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+
+  sync:
+    name: Rebase, verify, repair
+    needs: plan
+    if: needs.plan.outputs.needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    outputs:
+      pushed: ${{ steps.push.outputs.pushed }}
+    env:
+      MODE: ${{ needs.plan.outputs.mode }}
+      TARGET: ${{ needs.plan.outputs.target }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=blob:none origin \
+            '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/mods-*:refs/tags/mods-*'
+          git -c checkout.workers=0 checkout -q -B main refs/remotes/origin/main
+          git config user.name "t3-mods-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config rerere.enabled true
+          git config rerere.autoupdate true
+
+      - name: Restore rerere cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .git/rr-cache
+          key: rerere-${{ github.run_id }}
+          restore-keys: rerere-
+
+      - name: Rebase
+        id: rebase
+        shell: bash
+        run: |
+          set +e
+          node mods/scripts/sync.mjs --target "$TARGET" --prefer next
+          code=$?
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          [ "$code" -le 2 ]
+
+      - name: Setup Vite+
+        if: steps.rebase.outputs.status != 'up-to-date' || inputs.force
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install Claude Code
+        if: steps.rebase.outputs.status != 'up-to-date' && env.CLAUDE_CODE_OAUTH_TOKEN != ''
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Repair conflicts
+        if: steps.rebase.outputs.status == 'conflicts'
+        shell: bash
+        run: |
+          bash mods/scripts/repair.sh conflicts "$TARGET" "${{ steps.rebase.outputs.target_sha }}"
+          if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+            echo "::error::Rebase still in progress after repair."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        if: steps.rebase.outputs.status != 'up-to-date' || inputs.force
+        run: vp install --filter=@t3tools/web... --filter=t3... --filter=@t3tools/desktop... --filter=@t3tools/oxlint-plugin-t3code...
+
+      - name: Verify (with repair)
+        id: verify
+        if: steps.rebase.outputs.status != 'up-to-date' || inputs.force
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if node mods/scripts/verify.mjs; then
+              echo "repaired=$([ "$attempt" -gt 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [ "$attempt" -eq 3 ] && break
+            bash mods/scripts/repair.sh verify "$TARGET" "${{ steps.rebase.outputs.target_sha }}" || break
+          done
+          echo "::error::Mod stack does not verify on $TARGET."
+          exit 1
+
+      - name: Push
+        id: push
+        if: steps.rebase.outputs.status != 'up-to-date' || inputs.force
+        shell: bash
+        env:
+          MAIN_SHA: ${{ steps.rebase.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "canary" ]; then
+            git push -q --force origin HEAD:refs/heads/next
+            git push -q --force origin "$MAIN_SHA:refs/tags/mods-next-source"
+            echo "Canary: next now carries the mod stack on upstream main."
+          elif [ "${{ steps.rebase.outputs.status }}" != "up-to-date" ]; then
+            # Keep the previous main reachable, then move main.
+            git push -q origin "$MAIN_SHA:refs/tags/mods-pre-$TARGET"
+            git push -q --force-with-lease="main:$MAIN_SHA" origin HEAD:refs/heads/main
+            echo "main now carries the mod stack on $TARGET."
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save failed attempt
+        if: failure() && steps.rebase.outputs.code != '1'
+        shell: bash
+        run: |
+          if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then git rebase --abort || true; exit 0; fi
+          git push -q --force origin "HEAD:refs/heads/repair/$MODE-$TARGET" || true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mods-verify-report
+          path: mods/verify-report.md
+          if-no-files-found: ignore
+
+      - name: Open issue
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Mods sync ($MODE) onto $TARGET failed"
+          body="Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          main and the installed build are unchanged. The attempt (if any) is on branch \`repair/$MODE-$TARGET\`.
+
+          $( [ -f mods/verify-report.md ] && cat mods/verify-report.md )"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+
+  build:
+    name: Build and publish
+    needs: [plan, sync]
+    if: needs.plan.outputs.mode == 'stable' && needs.sync.outputs.pushed == 'true'
+    uses: ./.github/workflows/mods-build.yml
+    with:
+      ref: main
+      publish: true
