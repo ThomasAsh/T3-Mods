@@ -3,7 +3,7 @@
 Personal mods for T3 Code, kept alive across upstream updates by an auto-rebasing,
 self-repairing build pipeline.
 
-Status: **confirmed 2026-10-05**. Decisions in section 9.
+Status: **confirmed 2026-10-05, updated 2026-10-06**. Decisions in section 9.
 
 ---
 
@@ -46,7 +46,7 @@ upstream stable tag ─▶ rebase stack ─▶ verify ─▶ (repair ⟲ verify)
         ▲ hourly check          daily canary on main ─▶ same, but no publish (early warning)
 ```
 
-1. **Detect.** A scheduled workflow checks hourly for new upstream stable tags. It also runs a daily canary against `main`.
+1. **Detect.** A scheduled workflow watches the followed channel: hourly for stable tags, daily for nightlies. While following stable, it also runs a daily canary against upstream `main`.
 2. **Rebase** the stack onto the tag, with `git rerere` on so resolved conflicts stay resolved.
 3. **Verify:**
    - Install and run a targeted typecheck (contracts, server, web).
@@ -78,83 +78,51 @@ Safety rails:
 
 ## 4. Mod 1: Agents in the bottom panel
 
-- The bottom drawer gets a slim tab strip: **Terminal** | **Agents ●n**, where n is the live count.
+- The bottom drawer gets a slim tab strip: **Terminal** | **Agents ●n**, where n counts the current turn's working subagents.
   - Terminal tabs and splits work exactly as before.
   - Terminals stay mounted (PTYs alive) while Agents is showing.
-- Setting: *Settings › General › Show Agents in bottom panel*, on by default. The right-panel Agents tab stays for as long as upstream keeps it.
-- The drawer can open on Agents with **no terminal and no project**. Today, opening the drawer always creates a terminal, and closing the last terminal closes the drawer; both behaviours change for the Agents tab.
-- Shortcut `Ctrl+Shift+J` opens or toggles Agents. It's handled in the client, with no contract change, so a vanilla server or remote environment still works.
-- The active tab and drawer height persist per thread.
-- **v0.0.46 port:** upstream deletes `AgentsPanel`, so the mod keeps its own copy (`mods/agents/AgentsPanel.tsx`). It reads the new orchestrator's subagent roster and lineage, the same data mobile's Agents sheet uses. This gets built on `mods/next` before v0.0.46 ships.
-- Mobile isn't affected (it has no bottom panel).
+- **Agents** hosts upstream's lineage panel (`ThreadRelationshipsPanel`): running and previous subagents, forks and parents. The new orchestrator deleted the old right-panel Agents surface; this panel is its upstream successor, so the mod hosts it rather than keeping a copy.
+- Setting: *Settings › General › Agents in bottom panel*, on by default.
+- The drawer can open on Agents with **no terminal and no project**.
+- `Ctrl+Alt+J` toggles Agents (client-only, so a vanilla or remote server still works). Active tab and height persist per thread.
+- Mobile isn't affected (it has no bottom panel, and has its own Agents sheet).
 
 ## 5. Mod 2: Account auto-router
 
-**Goal:** your accounts behave like one pooled account. The router's main job is finishing work already started when an account runs dry, and it moves as little context as possible.
+**Goal:** your accounts behave like one pooled account per provider. The router's main job is finishing work already started when an account runs dry, and it moves as little context as possible. Spec: [`account-router/INTENT.md`](account-router/INTENT.md).
 
 ### Policy
-1. **Pool.**
-   - Every enabled, signed-in Claude instance in the environment is in the pool, deduplicated by account email.
-   - **New accounts join automatically** when you add them in Settings › Providers.
-   - Each account has an "exclude from routing" toggle.
-2. **Sticky.**
-   - A thread stays on its account, because prompt cache is per account.
-   - It never switches mid-turn, and never switches just to rebalance.
-3. **Switch only when needed:**
-   - The account is blocked, **or**
-   - it's projected to block: 5-hour window ≥ 92%, weekly ≥ 97%, or the model's own weekly limit. The projection uses the thread's recent burn rate.
-4. **Limit hit mid-turn.** Instead of "resume at reset", the router auto-continues on the best other account ("Continue where you left off."). If every account is exhausted, it falls back to vanilla resume-at-reset on whichever account resets soonest.
-5. **Cheapest adequate transfer:**
-   - Small context (< ~120k tokens): **full native resume**, which gives exact continuity. This depends on spike S1.
-   - Large context: T3's **portable handoff** (≤16k-token summary plus pointers to read the thread).
-   - The destination becomes sticky, so there's no ping-pong.
-   - Returning to an account the thread already used reuses its native session plus a delta only.
-6. **New threads** go to the account with the most usable headroom, since there's no cache to lose yet.
-   - Ranking is use-it-or-lose-it: prefer the account whose weekly allowance resets soonest while it still has more than the reserve.
-   - Ties are broken by 5-hour headroom.
-7. **Subagents and forks** inherit the parent's account. Scheduled tasks and agent-created threads route like new threads.
-8. **Same model always.** Opus stays Opus. If the model's own limit is exhausted on every account, the thread pauses; the router never silently downgrades.
-9. **Fail-open.** Any router error falls back to vanilla behaviour, using the selection the client sent.
-
-### UX
-- The model picker's account chip reads **Auto · EAP**. Picking a specific account **pins** the thread, and the router leaves it alone.
-- When the router moves a thread, the timeline shows a one-line note: *"Continued on EAP — HDG hit its 5-hour limit (resets 14:30)."*
-- The usage popover gets a pooled meter that sums all accounts.
-- *Settings › Providers › Auto-routing*:
-  - On/off.
-  - Reserve thresholds.
-  - Exclude accounts.
-  - Transfer mode (Smart / Full / Summary).
-  - Log of the last 50 decisions.
-- Fresher usage data, only when it's needed: while the router is on, accounts above 80% are probed every 60 s.
-- Routing happens **on the server**, so it also applies to threads driven from mobile, web or MCP.
+1. **Pool.** Every enabled, signed-in instance of a provider, deduplicated by config dir. New accounts join automatically; each can be switched off in Settings. Single-account providers (Codex today) are left alone.
+2. **Sticky.** A thread stays on its account while it has room, because prompt cache is per account. Never moved just to rebalance.
+3. **Failover (the main job).** When a run fails on a usage limit, the router immediately continues it on the best other account ("Continue where you left off. (Moved from HDG to EAP: HDG hit its usage limit.)"). Queued plain-text follow-ups move with it. If no account has room, upstream's resume-at-reset applies.
+4. **Before a turn starts**, an account at ≥ 90% of its 5-hour window or ≥ 97% of a weekly window (including the model's own weekly) counts as nearly full; the thread moves to a healthy account if there is one.
+5. **Cheapest transfer.** The router only changes the thread's account; upstream's provider switch carries the context: a summary of ≤ 16k tokens plus thread-read pointers on the first visit to an account, and a native resume plus delta when returning to one. The destination is sticky, and the account it left counts as blocked until its reset, so there's no ping-pong.
+6. **New threads** start on the account with the most usable room: healthy first, then weekly allowance that resets within 24 h, then the most 5-hour room.
+7. **Same model always.** Never changes provider or model.
+8. **Fail-open.** Any router error dispatches the command as sent.
 
 ### Where it hooks
-All hooks are server-side and run before the orchestrator dispatches, so the orchestrator stays pure:
-- Thread intake (new threads and follow-ups).
-- Queue dequeue re-planning.
-- The usage-limit recovery worker.
-- MCP and scheduled-task launches.
+- One wrapper on `OrchestratorV2.dispatch` (in `runtimeLayer.ts`), so clients, MCP tools, scheduled tasks and launches all pass it.
+- A reactor on the orchestrator's domain events for limit failures, plus a one-minute sweep as a fallback.
+- Two flat server settings: `accountRoutingEnabled`, `accountRoutingExcludedInstanceIds`.
 
-The contract change is additive only: an optional `routing: "auto" | "pinned"` field.
+### Left out on purpose
+- **Native cross-account resume** (copying a transcript between config dirs, spike S1). Upstream's handoff already moves at most a 16k summary, which is cheaper than re-reading a full transcript uncached, and it needs no adapter changes.
+- **Per-thread pins, an "Auto" chip and a decision-log UI.** An account picked in the composer is honoured while it has room, which covers pinning in practice. Decisions are logged on the server (`t3mods.account-router.*`).
 
-### Why it ships on v0.0.46
-- v0.0.45 can't move threads between separate account dirs, and the handoff and recovery machinery only exists in the new orchestrator.
-- So we build it on `mods/next` now, and it ships automatically with the first stable release that includes the new orchestrator.
+## 6. Spikes
 
-## 6. Spikes (answered before building)
-
-- **S1, cross-account native resume.** Can a Claude session created on account A resume on account B once its transcript is copied into B's config dir? The risk is thinking-block signatures bound to the account. If it doesn't work, all transfers use the summary.
-- **S2, usage freshness.** Is the probe plus `rate_limit_event` early and accurate enough to switch *before* the hard limit?
+- **S1, cross-account native resume:** not needed (see above).
+- **S2, usage freshness:** in-turn `rate_limit_event`s keep the active account current; idle accounts refresh with the regular probe (every 5 min). A limit hit mid-turn is handled by failover anyway.
 
 ## 7. Phases
 
 | Phase | Deliverable | Ships on |
 |---|---|---|
-| 0. Foundation | Repo and fork hygiene, CI pipeline (rebase, verify, repair, build, publish), local updater with backup and rollback, spikes S1 and S2 | — |
-| 1. Agents bottom tab | Mod 1 on v0.0.45. First modded install, which proves the pipeline end to end, including a rollback drill | v0.0.45 |
-| 2. Router + Agents port | Mod 2, plus Mod 1 ported to the new orchestrator, both on `mods/next` | first stable with the new orchestrator (v0.0.46) |
-| 3. Tuning | Review a week of router decisions; tune thresholds | — |
+| 0. Foundation | Repo, CI pipeline (rebase, verify, repair, build, publish), local updater with backup and rollback | done |
+| 1. Agents bottom tab | Mod 1 | v0.0.45 build, then ported to the nightlies |
+| 2. Router | Mod 2 | nightly builds now (channel decision below) |
+| 3. Tuning | Review a week of router decisions in the server log; tune thresholds | — |
 
 ## 8. Honest limits
 
@@ -170,3 +138,4 @@ The contract change is additive only: an optional `routing: "auto" | "pinned"` f
 | Build host | **GitHub Actions** in the private repo. AI repair uses a `CLAUDE_CODE_OAUTH_TOKEN` repo secret (from `claude setup-token`). |
 | Router timing | Built on `next` against the new orchestrator; ships with **v0.0.46 stable**. Mod 1 ships on v0.0.45 now. |
 | Agents layout | **Tabs**: Terminal \| Agents ●n in the bottom drawer. |
+| Channel (2026-10-06) | The installed app moved to the Nightly channel, whose data migration can't be undone. Builds follow **upstream nightlies** (one build a day) until v0.0.46 stable ships, then follow stable releases automatically (`mods.json` `upstream`). |
