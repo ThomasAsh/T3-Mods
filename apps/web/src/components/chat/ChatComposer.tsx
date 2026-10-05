@@ -1136,6 +1136,7 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { readEnvironmentScope } from "../../state/session";
 import { serverEnvironment } from "../../state/server";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
+import { useRoutedComposerInstance } from "~/mods/accountRouter/useRoutedComposerInstance";
 
 const WORKSPACE_SNAPSHOT_RETRY_COOLDOWN_MS = 10_000;
 
@@ -2127,7 +2128,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       ),
     [providerStatuses, settings],
   );
-  const selectedProviderByThreadId = composerDraft.activeProvider ?? null;
+  // t3-mods: account-router — a pick of an account the thread left follows the thread.
+  const selectedProviderByThreadId = useRoutedComposerInstance(
+    environmentId,
+    activeThread,
+    composerDraft.activeProvider ?? null,
+  );
   const {
     selectedProviderEntry,
     requestedDriverKind,
