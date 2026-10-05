@@ -1,0 +1,108 @@
+import { useAtomValue } from "@effect/atom-react";
+import type { ThreadTurnSubagents } from "@t3tools/client-runtime/state/thread-subagents";
+import type { ResolvedKeybindingsConfig, ScopedThreadRef } from "@t3tools/contracts";
+import { Atom } from "effect/reactivity";
+import { useCallback, useEffect, useState } from "react";
+
+import { resolveShortcutCommand } from "~/keybindings";
+import { isMacPlatform } from "~/lib/utils";
+import { environmentThreadDetails } from "~/state/threads";
+
+import {
+  matchesAgentsTabShortcut,
+  planAgentsToggle,
+  planTerminalToggle,
+  resolveBottomPanelView,
+  type BottomPanelTransition,
+  type BottomPanelView,
+} from "./agentsBottomPanel.logic";
+import { selectAgentsOpen, useAgentsBottomPanelStore } from "./agentsBottomPanelStore";
+
+const NO_TURN_SUBAGENTS_ATOM = Atom.make<ThreadTurnSubagents | null>(null).pipe(
+  Atom.withLabel("t3mods-agents-bottom-panel:no-thread"),
+);
+
+/**
+ * Bottom panel controller for the active thread. ChatView routes its terminal toggle
+ * (Ctrl+J and the header button) through `toggleTerminal`; with the mod off that is
+ * exactly the vanilla toggle.
+ */
+export function useAgentsBottomPanel(input: {
+  readonly threadRef: ScopedThreadRef | null;
+  readonly terminalOpen: boolean;
+  /** Vanilla toggle: opens (creating a first terminal if needed) or closes the drawer. */
+  readonly toggleTerminalDrawer: () => void;
+  readonly setTerminalOpen: (open: boolean) => void;
+  readonly keybindings: ResolvedKeybindingsConfig;
+}): {
+  readonly enabled: boolean;
+  readonly view: BottomPanelView;
+  /** True when Agents opened from a closed panel, so the open animation should play. */
+  readonly animateOpen: boolean;
+  /** Subagents of the thread's current turn that are still working. */
+  readonly liveCount: number;
+  readonly toggleTerminal: () => void;
+  readonly toggleAgents: () => void;
+} {
+  const { threadRef, terminalOpen, toggleTerminalDrawer, setTerminalOpen, keybindings } = input;
+  const enabled = useAgentsBottomPanelStore((state) => state.enabled);
+  const agentsOpen = useAgentsBottomPanelStore((state) => selectAgentsOpen(state, threadRef));
+  const view = resolveBottomPanelView({ enabled, terminalOpen, agentsOpen });
+  const liveCount =
+    useAtomValue(
+      threadRef === null
+        ? NO_TURN_SUBAGENTS_ATOM
+        : environmentThreadDetails.turnSubagentsAtom(threadRef),
+    )?.liveCount ?? 0;
+
+  const [viewHistory, setViewHistory] = useState({ view, animateOpen: false });
+  if (viewHistory.view !== view) {
+    setViewHistory({ view, animateOpen: view === "agents" && viewHistory.view === "closed" });
+  }
+
+  const apply = useCallback(
+    (transition: BottomPanelTransition) => {
+      if (!threadRef) return;
+      useAgentsBottomPanelStore.getState().setAgentsOpen(threadRef, transition.agentsOpen);
+      if (transition.terminal === "close" && terminalOpen) setTerminalOpen(false);
+      if (transition.terminal === "open" && !terminalOpen) toggleTerminalDrawer();
+    },
+    [setTerminalOpen, terminalOpen, threadRef, toggleTerminalDrawer],
+  );
+
+  const toggleTerminal = useCallback(() => {
+    if (!enabled) {
+      toggleTerminalDrawer();
+      return;
+    }
+    apply(planTerminalToggle(view));
+  }, [apply, enabled, toggleTerminalDrawer, view]);
+
+  const toggleAgents = useCallback(() => {
+    if (enabled) apply(planAgentsToggle(view));
+  }, [apply, enabled, view]);
+
+  useEffect(() => {
+    if (!enabled) return;
+    const isMac = isMacPlatform(navigator.platform);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || !matchesAgentsTabShortcut(event, isMac)) return;
+      // A user keybinding on the same chord takes precedence over the mod.
+      if (resolveShortcutCommand(event, keybindings) !== null) return;
+      event.preventDefault();
+      event.stopPropagation();
+      toggleAgents();
+    };
+    window.addEventListener("keydown", onKeyDown, { capture: true });
+    return () => window.removeEventListener("keydown", onKeyDown, { capture: true });
+  }, [enabled, keybindings, toggleAgents]);
+
+  return {
+    enabled,
+    view,
+    animateOpen: viewHistory.animateOpen,
+    liveCount,
+    toggleTerminal,
+    toggleAgents,
+  };
+}

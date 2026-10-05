@@ -388,6 +388,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/general",
     searchTerms: ["automatically open diff pull request pr right panel agent completion"],
   },
+  // t3-mods: agents-bottom-panel
+  {
+    id: "agents-bottom-panel",
+    title: "Agents in bottom panel",
+    to: "/settings/general",
+    searchTerms: ["agents subagents lineage terminal drawer bottom panel tab fleet"],
+  },
   {
     id: "skills-in-slash-menu",
     title: "Show skills in slash menu",
