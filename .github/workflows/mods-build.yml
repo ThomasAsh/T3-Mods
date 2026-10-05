@@ -1,0 +1,243 @@
+name: Mods · Build Windows
+
+# Builds the modded Windows x64 installer from a ref and publishes it as a
+# private GitHub Release. The installer carries no update feed, so the in-app
+# updater stays off and a vanilla upstream build can never replace it; the
+# local T3 Mods Updater (mods/updater) installs these releases instead.
+#
+# Mirrors upstream's release split: the JS bundle builds on Linux, the
+# installer packages on Windows with the same-version upstream Linux CLI
+# archive embedded as the WSL runtime.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Ref to build
+        default: main
+        type: string
+      publish:
+        description: Publish a release
+        default: true
+        type: boolean
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      publish:
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mods-build-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  # Public T3 Connect identifiers, the same ones official builds bake in
+  # (see .env.example). They keep cloud pairing and the mobile app working.
+  T3CODE_CLERK_PUBLISHABLE_KEY: pk_live_Y2xlcmsudDMuY29kZXMk
+  T3CODE_CLERK_JWT_TEMPLATE: t3-relay
+  T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: hzxSgY2cH10sDU2r
+  T3CODE_RELAY_URL: https://relay.t3.codes
+
+jobs:
+  bundle:
+    name: Build JS bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      upstream_tag: ${{ steps.meta.outputs.upstream_tag }}
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      # Treeless clone: the full commit graph (to find the upstream base tag)
+      # without downloading history. Sparse checkout skips the vendored .repos
+      # tree, whose orphaned gitlinks break actions/checkout's cleanup.
+      - name: Checkout
+        shell: bash
+        env:
+          REF: ${{ inputs.ref }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=tree:0 --no-tags origin "$REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout -q --detach FETCH_HEAD
+
+      - name: Resolve build metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(node mods/scripts/upstream.mjs base)"
+          echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building $(git rev-parse --short HEAD) on upstream $tag"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install bundle dependencies
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Align package versions
+        run: node scripts/update-release-package-versions.ts "${{ steps.meta.outputs.version }}"
+
+      - name: Install browser secret helper build libraries
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+
+      - name: Build JS bundle
+        run: vp run build:desktop
+
+      - name: Upload JS bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    name: Package Windows x64
+    needs: bundle
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.bundle.outputs.version }}
+      UPSTREAM_TAG: ${{ needs.bundle.outputs.upstream_tag }}
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          SHA: ${{ needs.bundle.outputs.sha }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=tree:0 --no-tags origin "$SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout -q --detach FETCH_HEAD
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Install desktop dependencies
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: native/resource-monitor/target/x86_64-pc-windows-msvc/release/t3-resource-monitor.exe
+          key: resource-monitor-x86_64-pc-windows-msvc-${{ hashFiles('native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Spectre-mitigated MSVC libs
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -products * -latest -property installationPath
+          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $proc = Start-Process -FilePath $setupExe `
+            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
+            "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre", "--quiet", "--norestart" `
+            -Wait -PassThru -NoNewWindow
+          if ($null -eq $proc -or $proc.ExitCode -ne 0) { exit 1 }
+
+      - name: Align package versions
+        run: node scripts/update-release-package-versions.ts "${{ env.VERSION }}"
+
+      - name: Download JS bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: js-bundle
+          path: apps
+
+      # Upstream embeds its own same-version Linux CLI archive as the WSL
+      # runtime; reuse the published one (the WSL backend runs vanilla).
+      - name: Download upstream WSL runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$UPSTREAM_TAG" -R pingdotgg/t3code -p "t3-${VERSION}-linux-x64.tar.gz" -D wsl-runtime
+
+      - name: Build installer
+        shell: bash
+        env:
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
+        run: |
+          set -euo pipefail
+          # No GITHUB_REPOSITORY means no publish config, so no app-update.yml:
+          # the in-app updater is disabled in modded builds by design.
+          env -u GITHUB_REPOSITORY -u T3CODE_DESKTOP_UPDATE_REPOSITORY \
+            vp run dist:desktop:artifact \
+              --platform win --target nsis --arch x64 \
+              --build-version "$VERSION" \
+              --skip-build \
+              --wsl-runtime "$GITHUB_WORKSPACE/wsl-runtime/t3-${VERSION}-linux-x64.tar.gz" \
+              --verbose
+
+      - name: Write release manifest
+        shell: bash
+        env:
+          SHA: ${{ needs.bundle.outputs.sha }}
+        run: |
+          set -euo pipefail
+          exe="$(ls release/*.exe | head -1)"
+          if [ -e release/win-unpacked/resources/app-update.yml ]; then
+            echo "::error::Installer contains an update feed; refusing to publish." && exit 1
+          fi
+          node mods/scripts/manifest.mjs "$exe" "$VERSION" "$UPSTREAM_TAG" "$SHA" "${{ github.run_number }}" > release/mods-manifest.json
+          cat release/mods-manifest.json
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: installer-win-x64
+          path: |
+            release/*.exe
+            release/mods-manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish release
+        if: inputs.publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.bundle.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="mods-v${VERSION}-${{ github.run_number }}"
+          exe="$(ls release/*.exe | head -1)"
+          node mods/scripts/release-notes.mjs "$UPSTREAM_TAG" "$SHA" > release/notes.md
+          gh release create "$tag" "$exe" release/mods-manifest.json \
+            --repo "$GITHUB_REPOSITORY" --target "$SHA" \
+            --title "T3 Code ${VERSION} + mods (#${{ github.run_number }})" \
+            --notes-file release/notes.md --latest
