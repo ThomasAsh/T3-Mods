@@ -237,7 +237,7 @@ jobs:
           tag="mods-v${VERSION}-${{ github.run_number }}"
           exe="$(ls release/*.exe | head -1)"
           node mods/scripts/release-notes.mjs "$UPSTREAM_TAG" "$SHA" > release/notes.md
-          gh release create "$tag" "$exe" release/mods-manifest.json \
+          gh release create "$tag" "$exe" release/mods-manifest.json mods/updater/T3ModsUpdater.ps1 \
             --repo "$GITHUB_REPOSITORY" --target "$SHA" \
             --title "T3 Code ${VERSION} + mods (#${{ github.run_number }})" \
             --notes-file release/notes.md --latest
