@@ -8,7 +8,7 @@
 //   node mods/scripts/verify.mjs [--skip-install-check]
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -62,7 +62,7 @@ for (const file of sourceFiles) {
 }
 for (const packageDir of ["apps/web", "apps/server", "apps/desktop", "packages/contracts", "packages/shared", "packages/client-runtime"]) {
   for (const path of walk(join(root, packageDir, "src", "mods"))) {
-    const file = path.slice(root.length).replace(/\/g, "/").replace(/^\//, "");
+    const file = relative(root, path).split(sep).join("/");
     if (isRunnableTest(file)) testFiles.add(file);
   }
 }
