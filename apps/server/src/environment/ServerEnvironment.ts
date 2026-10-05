@@ -227,6 +227,7 @@ export const make = Effect.gen(function* () {
       requiredWorktreeBootstrap: true,
       threadSettlement: true,
       threadAutoSettlement: true,
+      accountRouting: true, // t3-mods: account-router
       storageCleanup: true,
       projectWorktreeCleanup: true,
       worktreesDirectory: true,
