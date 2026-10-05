@@ -140,6 +140,7 @@ import { ScopedSwitch } from "./ScopedSwitch";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { ThemeLibrary } from "./ThemeSettings";
+import { AccountRoutingSettingsRow } from "~/mods/accountRouter/AccountRoutingSettingsRow"; // t3-mods: account-router
 import {
   backgroundActivityOverrideSettings,
   backgroundActivitySharedPolicySettings,
@@ -2363,6 +2364,8 @@ export function GeneralSettingsPanel() {
             />
           }
         />
+        {/* t3-mods: account-router */}
+        <AccountRoutingSettingsRow providers={serverProviders} />
 
         <SettingsRow
           {...searchableSetting("working-shelf")}

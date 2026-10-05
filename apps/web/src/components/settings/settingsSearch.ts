@@ -308,6 +308,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/general",
     searchTerms: ["usage quota rate limit reset recover continue"],
   },
+  // t3-mods: account-router
+  {
+    id: "account-routing",
+    title: "Route between accounts",
+    to: "/settings/general",
+    searchTerms: ["account router pool usage quota rate limit switch failover continue claude"],
+  },
   {
     id: "working-shelf",
     title: "Working section (beta)",
