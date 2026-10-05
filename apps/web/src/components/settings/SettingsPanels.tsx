@@ -139,6 +139,8 @@ import { ScopedSwitch } from "./ScopedSwitch";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { ThemeLibrary } from "./ThemeSettings";
+// t3-mods: agents-bottom-panel
+import { AgentsBottomPanelSettingsRow } from "~/mods/agentsBottomPanel/AgentsBottomPanelSettingsRow";
 import {
   backgroundActivityOverrideSettings,
   backgroundActivitySharedPolicySettings,
@@ -2701,6 +2703,9 @@ export function GeneralSettingsPanel() {
             />
           }
         />
+
+        {/* t3-mods: agents-bottom-panel */}
+        <AgentsBottomPanelSettingsRow />
 
         <SettingsRow
           {...searchableSetting("skills-in-slash-menu")}

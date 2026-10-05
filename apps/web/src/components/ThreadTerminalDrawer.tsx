@@ -1016,6 +1016,8 @@ interface ThreadTerminalDrawerProps {
   terminalLabelsById?: ReadonlyMap<string, string>;
   /** Prefer per-session launch locations when the server already knows a terminal. */
   terminalLaunchLocationsById?: ReadonlyMap<string, TerminalLaunchLocation>;
+  /** t3-mods: agents-bottom-panel tab row, rendered above the terminals in drawer mode. */
+  header?: ReactNode;
 }
 
 interface TerminalActionButtonProps {
@@ -1075,8 +1077,10 @@ export default function ThreadTerminalDrawer({
   keybindings,
   terminalLabelsById,
   terminalLaunchLocationsById,
+  header,
 }: ThreadTerminalDrawerProps) {
   const isPanel = mode === "panel";
+  const drawerHeader = isPanel ? null : header; // t3-mods: agents-bottom-panel
   const [advancedTypography] = useLocalStorage(
     TYPOGRAPHY_ADVANCED_STORAGE_KEY,
     false,
@@ -1306,6 +1310,13 @@ export default function ThreadTerminalDrawer({
     lastSyncedHeightRef.current = controlledDrawerHeight;
   }, [controlledDrawerHeight, threadId]);
 
+  // t3-mods: agents-bottom-panel. The Agents tab resizes the same stored height while
+  // this drawer stays mounted behind it; adopt that height unless a drag is in progress.
+  useEffect(() => {
+    if (resizeStateRef.current) return;
+    setDrawerHeight(controlledDrawerHeight);
+  }, [controlledDrawerHeight, setDrawerHeight]);
+
   const handleResizePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     event.preventDefault();
@@ -1409,6 +1420,7 @@ export default function ThreadTerminalDrawer({
             onPointerCancel={handleResizePointerEnd}
           />
         ) : null}
+        {drawerHeader}
         <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-4 py-6 text-center text-sm text-muted-foreground">
           <p>No terminal sessions for this thread yet.</p>
           <Button size="xs" variant="outline" onClick={onNewTerminalAction}>
@@ -1440,9 +1452,15 @@ export default function ThreadTerminalDrawer({
           onPointerCancel={handleResizePointerEnd}
         />
       ) : null}
+      {drawerHeader}
 
       {!hasTerminalSidebar && (
-        <div className="pointer-events-none absolute right-2 top-2 z-20">
+        <div
+          className={cn(
+            "pointer-events-none absolute right-2 z-20",
+            drawerHeader ? "top-[3px]" : "top-2", // t3-mods: sit inside the tab row
+          )}
+        >
           <div className="pointer-events-auto inline-flex items-center overflow-hidden rounded-md border border-border/80 bg-background shadow-xs">
             <TerminalActionButton
               className={`p-1 text-foreground/90 transition-colors ${
