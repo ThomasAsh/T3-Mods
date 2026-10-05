@@ -1,0 +1,19 @@
+{
+  "mods": [
+    {
+      "id": "fork-hygiene",
+      "title": "Fork hygiene: own CI pipeline, no upstream update feed",
+      "enabled": true
+    },
+    {
+      "id": "agents-bottom-panel",
+      "title": "Agents tab in the bottom panel, alongside the terminal",
+      "enabled": false
+    },
+    {
+      "id": "account-router",
+      "title": "Account auto-router across provider accounts",
+      "enabled": false
+    }
+  ]
+}
