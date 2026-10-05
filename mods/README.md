@@ -27,9 +27,30 @@ Each mod is one commit on top of the upstream tag, kept in the order of [`mods.j
 
 | Workflow | When | What |
 |---|---|---|
-| `mods-sync` | Hourly | Detects a new upstream stable tag, rebases `main`, verifies, repairs with Claude Code if needed, then builds |
-| `mods-canary` | Daily | Same against upstream `main` on `next`; never publishes |
+| `mods-sync` (stable) | Hourly | Detects a new upstream stable tag, rebases `main`, verifies, repairs with Claude Code if needed, then builds and publishes |
+| `mods-sync` (canary) | Daily | Same against upstream `main`, pushed to `next`; never publishes |
+| `mods-verify` | Push to `main`, `next`, `mod/**`, `repair/**` | Typecheck, tests and lint for what the stack touches |
 | `mods-build` | On demand or from sync | Windows x64 installer, published as a private release |
+
+`next` is derived from `main`. The tag `mods-next-source` records which `main` commit it was built from. A stable sync reuses `next` (and the ports already done there) only while `main` is unchanged and `next`'s upstream base is part of the new release. Otherwise it rebases `main`.
+
+Develop mods on `mod/<name>` branches. Once verify is green, rebase onto `main` and fast-forward.
+
+## Local updater
+
+Install it once per machine:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File mods\updater\Install-T3ModsUpdater.ps1
+& "$env:LOCALAPPDATA\T3ModsUpdater\T3ModsUpdater.ps1" -Mode now   # first install; closes T3 Code
+```
+
+After that, the scheduled task installs new releases whenever T3 Code is idle. Other modes:
+
+- `-Mode status` shows the current state.
+- `-Mode rollback` restores the previous build.
+
+Logs are in `%LOCALAPPDATA%\T3ModsUpdater\updater.log`.
 
 Modded installers ship with **no update feed**, so the in-app updater is off and a vanilla build can't replace them. The local updater ([`updater/`](updater)) installs releases instead. Before installing it:
 
