@@ -218,6 +218,10 @@ import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs } from "./RightPanelTabs";
 import { AgentsPanel } from "./AgentsPanel";
+// t3-mods: agents-bottom-panel
+import { AgentsBottomPane } from "~/mods/agentsBottomPanel/AgentsBottomPane";
+import { TerminalDrawerTabs } from "~/mods/agentsBottomPanel/BottomPanelTabs";
+import { useAgentsBottomPanel } from "~/mods/agentsBottomPanel/useAgentsBottomPanel";
 import { LinkPullRequestDialogHost } from "./pullRequest/LinkPullRequestDialog";
 import { ThreadPullRequestsPanel } from "./pullRequest/ThreadPullRequestsPanel";
 import { useDeviceState } from "~/state/device";
@@ -900,6 +904,8 @@ interface PersistentThreadTerminalDrawerProps {
   closeShortcutLabel: string | undefined;
   keybindings: ResolvedKeybindingsConfig;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
+  /** t3-mods: agents-bottom-panel. Live agent count for the tab row; undefined hides it. */
+  agentsTabLiveCount?: number | undefined;
 }
 
 const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDrawer({
@@ -914,6 +920,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
   closeShortcutLabel,
   keybindings,
   onAddTerminalContext,
+  agentsTabLiveCount,
 }: PersistentThreadTerminalDrawerProps) {
   const openTerminal = useAtomCommand(terminalEnvironment.open, "terminal open");
   const writeTerminal = useAtomCommand(terminalEnvironment.write, "terminal write");
@@ -1264,6 +1271,16 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
           onAddTerminalContext={handleAddTerminalContext}
           terminalLabelsById={terminalLabelsById}
           terminalLaunchLocationsById={terminalLaunchLocationsById}
+          header={
+            // t3-mods: agents-bottom-panel
+            agentsTabLiveCount !== undefined ? (
+              <TerminalDrawerTabs
+                threadRef={threadRef}
+                liveCount={agentsTabLiveCount}
+                keybindings={keybindings}
+              />
+            ) : undefined
+          }
         />
       </div>
     </div>
@@ -4064,6 +4081,21 @@ export default function ChatView(props: ChatViewProps) {
     terminalUiState.terminalIds.length,
     terminalUiState.terminalOpen,
   ]);
+  // t3-mods: agents-bottom-panel. Every terminal toggle goes through this controller,
+  // which is the vanilla toggle when the mod is off.
+  const {
+    enabled: agentsBottomPanelEnabled,
+    view: bottomPanelView,
+    animateOpen: agentsBottomPaneAnimateOpen,
+    toggleTerminal: toggleBottomPanelTerminal,
+    showAgents: showAgentsBottomTab,
+  } = useAgentsBottomPanel({
+    threadRef: activeThreadRef,
+    terminalOpen: terminalUiState.terminalOpen,
+    toggleTerminalDrawer: toggleTerminalVisibility,
+    setTerminalOpen,
+    keybindings,
+  });
   const splitTerminal = useCallback(
     (direction: "horizontal" | "vertical" = "horizontal") => {
       if (!activeThreadRef || hasReachedSplitLimit || !activeThreadId || !activeProject) {
@@ -6283,7 +6315,9 @@ export default function ChatView(props: ChatViewProps) {
     const liveCount = agentPanelModel.liveCount;
     // Hidden once the Agents surface is on screen; the link would point at nothing.
     const showViewAgents =
-      liveCount > 0 && !(rightPanelOpen && activeRightPanelSurface?.kind === "agents");
+      liveCount > 0 &&
+      !(rightPanelOpen && activeRightPanelSurface?.kind === "agents") &&
+      bottomPanelView !== "agents"; // t3-mods: agents-bottom-panel
     return {
       id: `background-liveness:${activeThread.id}`,
       variant: "default",
@@ -6302,7 +6336,13 @@ export default function ChatView(props: ChatViewProps) {
       actions: (
         <>
           {showViewAgents ? (
-            <Button size="xs" variant="ghost" aria-label="View agents" onClick={addAgentsSurface}>
+            <Button
+              size="xs"
+              variant="ghost"
+              aria-label="View agents"
+              // t3-mods: agents-bottom-panel
+              onClick={agentsBottomPanelEnabled ? showAgentsBottomTab : addAgentsSurface}
+            >
               View
             </Button>
           ) : null}
@@ -6323,9 +6363,12 @@ export default function ChatView(props: ChatViewProps) {
     activeThread,
     addAgentsSurface,
     agentPanelModel.liveCount,
+    agentsBottomPanelEnabled,
+    bottomPanelView,
     handleStopBackgroundWork,
     isStoppingBackgroundWork,
     rightPanelOpen,
+    showAgentsBottomTab,
   ]);
   // A woken thread announces itself in the open view, not just the sidebar
   // pill. Dismissing marks the wake as seen (same acknowledgment as the
@@ -6778,7 +6821,7 @@ export default function ChatView(props: ChatViewProps) {
       if (command === "terminal.toggle") {
         event.preventDefault();
         event.stopPropagation();
-        toggleTerminalVisibility();
+        toggleBottomPanelTerminal(); // t3-mods: agents-bottom-panel
         return;
       }
 
@@ -6966,7 +7009,7 @@ export default function ChatView(props: ChatViewProps) {
     getShortcutContext,
     toggleRightPanel,
     toggleRightPanelMaximized,
-    toggleTerminalVisibility,
+    toggleBottomPanelTerminal,
     composerRef,
   ]);
 
@@ -9486,7 +9529,7 @@ export default function ChatView(props: ChatViewProps) {
   const panelToggleControls = (
     <PanelLayoutControls
       terminalAvailable={activeProject !== null}
-      terminalOpen={terminalUiState.terminalOpen}
+      terminalOpen={bottomPanelView !== "closed" /* t3-mods: agents-bottom-panel */}
       terminalShortcutLabel={shortcutLabelForCommand(keybindings, "terminal.toggle")}
       rightPanelAvailable={activeProject !== null}
       rightPanelOpen={rightPanelOpen}
@@ -9494,9 +9537,12 @@ export default function ChatView(props: ChatViewProps) {
       // Suppressed while the Agents surface is visible: the roster itself is
       // on screen, so the toggle badge would be pointing at nothing.
       liveAgentCount={
-        rightPanelOpen && activeRightPanelSurface?.kind === "agents" ? 0 : agentPanelModel.liveCount
+        (rightPanelOpen && activeRightPanelSurface?.kind === "agents") ||
+        bottomPanelView === "agents" // t3-mods: agents-bottom-panel
+          ? 0
+          : agentPanelModel.liveCount
       }
-      onToggleTerminal={toggleTerminalVisibility}
+      onToggleTerminal={toggleBottomPanelTerminal /* t3-mods: agents-bottom-panel */}
       onToggleRightPanel={toggleRightPanel}
     />
   );
@@ -10245,7 +10291,14 @@ export default function ChatView(props: ChatViewProps) {
             key={mountedThreadKey}
             threadRef={mountedThreadRef}
             threadId={mountedThreadRef.threadId}
-            active={mountedThreadKey === activeThreadKey}
+            // t3-mods: agents-bottom-panel. Behind the Agents tab the drawer stays
+            // mounted like a background thread's, so its terminals keep running.
+            active={mountedThreadKey === activeThreadKey && bottomPanelView !== "agents"}
+            agentsTabLiveCount={
+              mountedThreadKey === activeThreadKey && agentsBottomPanelEnabled
+                ? agentPanelModel.liveCount
+                : undefined
+            }
             launchContext={
               mountedThreadKey === activeThreadKey ? (activeTerminalLaunchContext ?? null) : null
             }
@@ -10258,6 +10311,24 @@ export default function ChatView(props: ChatViewProps) {
             onAddTerminalContext={addTerminalContextToDraft}
           />
         ))}
+        {/* t3-mods: agents-bottom-panel */}
+        {bottomPanelView === "agents" && activeThreadRef ? (
+          <AgentsBottomPane
+            key={activeThreadKey}
+            threadRef={activeThreadRef}
+            animateOpen={agentsBottomPaneAnimateOpen}
+            liveCount={agentPanelModel.liveCount}
+            terminalAvailable={activeProject !== null}
+            terminalShortcutLabel={shortcutLabelForCommand(keybindings, "terminal.toggle")}
+            onSelectTerminal={toggleBottomPanelTerminal}
+          >
+            <AgentsPanel
+              model={agentPanelModel}
+              environmentId={activeThreadRef.environmentId}
+              threadId={activeThreadRef.threadId}
+            />
+          </AgentsBottomPane>
+        ) : null}
       </div>
 
       {rightPanelPresent && !shouldUseRightPanelSheet && activeThreadRef ? (
