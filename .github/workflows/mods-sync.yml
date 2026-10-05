@@ -1,22 +1,27 @@
 name: Mods · Sync upstream
 
 # Keeps the mod stack on top of upstream (mods/scripts/sync.mjs):
-#   stable  hourly: a new upstream release tag → rebase main, verify, repair, build, publish
-#   canary  daily:  upstream main → rebase onto `next`, verify, repair; never publishes
+#   release  a new upstream tag on the followed channel → rebase main, verify, repair,
+#            build, publish. Stable is checked hourly; nightly once a day (05:23 AEST),
+#            so a busy nightly day still produces one build.
+#   canary   daily: upstream main → rebase onto `next`, verify, repair; never publishes.
+#            Skipped while following nightlies, which are already cut from main.
+# The channel comes from mods/mods.json `upstream` (see mods/scripts/upstream.mjs).
 # Repairs run Claude Code headless (mods/scripts/repair.sh) when CLAUDE_CODE_OAUTH_TOKEN
 # is set. If a stack can't be verified, nothing is pushed to main and an issue is opened.
 
 on:
   schedule:
     - cron: "17 * * * *"
+    - cron: "23 19 * * *"
     - cron: "41 19 * * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: "stable: latest release tag onto main · canary: upstream main onto next"
+        description: "release: latest tag on the followed channel onto main · canary: upstream main onto next"
         type: choice
-        options: [stable, canary]
-        default: stable
+        options: [release, canary]
+        default: release
       force:
         description: Rebuild and publish even when main is already on the latest tag
         type: boolean
@@ -62,17 +67,21 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
-          mode="${INPUT_MODE:-stable}"
+          mode="${INPUT_MODE:-release}"
           [ "$SCHEDULE" = "41 19 * * *" ] && mode=canary
+          channel="$(node mods/scripts/upstream.mjs channel)"
+          needed=false
           if [ "$mode" = "canary" ]; then
             target=main
-            needed=true
+            if [ "$channel" = "stable" ] || [ -z "$SCHEDULE" ]; then needed=true; fi
+            echo "Following $channel; canary needed: $needed"
           else
             target="$(node mods/scripts/upstream.mjs latest)"
             base="$(node mods/scripts/upstream.mjs base)"
-            needed=false
             if [ "$target" != "$base" ] || [ "$FORCE" = "true" ]; then needed=true; fi
-            echo "main is on $base; latest upstream release is $target"
+            # Nightlies land several times a day; take only the daily run's pick.
+            if [ "$channel" = "nightly" ] && [ "$SCHEDULE" = "17 * * * *" ]; then needed=false; fi
+            echo "Following $channel. main is on $base; latest upstream tag is $target"
           fi
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "target=$target" >> "$GITHUB_OUTPUT"
@@ -224,7 +233,7 @@ jobs:
   build:
     name: Build and publish
     needs: [plan, sync]
-    if: needs.plan.outputs.mode == 'stable' && needs.sync.outputs.pushed == 'true'
+    if: needs.plan.outputs.mode == 'release' && needs.sync.outputs.pushed == 'true'
     uses: ./.github/workflows/mods-build.yml
     with:
       ref: main
