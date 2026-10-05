@@ -210,9 +210,13 @@ jobs:
         run: |
           set -euo pipefail
           exe="$(ls release/*.exe | head -1)"
-          if [ -e release/win-unpacked/resources/app-update.yml ]; then
+          # The NSIS payload must not carry an update feed (see header comment).
+          7z x -y -o"$RUNNER_TEMP/payload" "$exe" '$PLUGINSDIR/app-64.7z' > /dev/null
+          payload="$(7z l "$RUNNER_TEMP/payload/\$PLUGINSDIR/app-64.7z")"
+          if grep -q 'resources\\app-update.yml' <<< "$payload"; then
             echo "::error::Installer contains an update feed; refusing to publish." && exit 1
           fi
+          grep -q 'resources\\wsl-runtime.tar.gz' <<< "$payload" || { echo "::error::Installer is missing the WSL runtime." && exit 1; }
           node mods/scripts/manifest.mjs "$exe" "$VERSION" "$UPSTREAM_TAG" "$SHA" "${{ github.run_number }}" > release/mods-manifest.json
           cat release/mods-manifest.json
 
