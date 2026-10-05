@@ -17,7 +17,7 @@
     {
       "id": "account-router",
       "title": "Account auto-router across provider accounts",
-      "enabled": false
+      "enabled": true
     }
   ]
 }
