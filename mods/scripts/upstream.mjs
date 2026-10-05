@@ -4,6 +4,7 @@
 //   node mods/scripts/upstream.mjs base     newest stable tag that HEAD is built on
 //   node mods/scripts/upstream.mjs latest   newest stable tag upstream has published
 //   node mods/scripts/upstream.mjs sha <tag> commit a tag points at
+//   node mods/scripts/upstream.mjs list     all stable tags as JSON [{ tag, sha }]
 //
 // Stable tags are plain vX.Y.Z; nightly and preview tags carry a suffix and are
 // ignored. Works in treeless clones: only commit ancestry is consulted.
@@ -49,6 +50,10 @@ function isAncestorOfHead(sha) {
 function main() {
   const [command, arg] = process.argv.slice(2);
   const tags = listStableTags();
+  if (command === "list") {
+    console.log(JSON.stringify(tags.map(({ tag, sha }) => ({ tag, sha }))));
+    return;
+  }
   if (command === "latest") {
     console.log(tags[0]?.tag ?? "");
     return;
@@ -65,7 +70,7 @@ function main() {
     console.log(base.tag);
     return;
   }
-  throw new Error(`Usage: upstream.mjs base|latest|sha <tag>`);
+  throw new Error(`Usage: upstream.mjs base|latest|list|sha <tag>`);
 }
 
 main();
