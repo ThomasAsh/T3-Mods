@@ -12,7 +12,7 @@
     {
       "id": "agents-bottom-panel",
       "title": "Agents tab in the bottom panel, alongside the terminal",
-      "enabled": false
+      "enabled": true
     },
     {
       "id": "account-router",
