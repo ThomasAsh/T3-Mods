@@ -45,7 +45,7 @@ $KeepBackups = 3
 New-Item -ItemType Directory -Force -Path $Root, $DownloadsDir, $BackupsDir | Out-Null
 
 function Write-Log([string]$Message) {
-  $line = "{0:u}  {1}" -f (Get-Date), $Message
+  $line = "{0}  {1}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:sszzz"), $Message
   Add-Content -Path $LogPath -Value $line
   Write-Host $line
   if ((Get-Item $LogPath).Length -gt 1MB) {
