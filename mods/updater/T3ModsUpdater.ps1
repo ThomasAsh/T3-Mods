@@ -107,6 +107,28 @@ function Get-AppExe {
   return $exe.FullName
 }
 
+# The uninstaller carries the full version ("0.0.46-nightly.20261005.2702"); the app exe does not.
+function Get-InstalledVersion {
+  $uninstaller = Get-ChildItem $InstallDir -Filter "Uninstall T3 Code*.exe" -File -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $uninstaller) { return $null }
+  return $uninstaller.VersionInfo.ProductVersion
+}
+
+# Sortable key: stable X.Y.Z sorts after its own nightlies, nightlies by date and build.
+function ConvertTo-VersionKey([string]$Version) {
+  if ($Version -notmatch '^(\d+)\.(\d+)\.(\d+)(?:-nightly\.(\d{8})\.(\d+))?$') { return $null }
+  $stable = 1; $date = 0; $build = 0
+  if ($Matches[4]) { $stable = 0; $date = [int]$Matches[4]; $build = [int]$Matches[5] }
+  return "{0:D6}{1:D6}{2:D6}{3}{4:D8}{5:D8}" -f [int]$Matches[1], [int]$Matches[2], [int]$Matches[3], $stable, $date, $build
+}
+
+function Test-OlderThanInstalled([string]$Tag) {
+  $installed = ConvertTo-VersionKey (Get-InstalledVersion)
+  $release = ConvertTo-VersionKey ($Tag -replace '^mods-v(.+)-\d+$', '$1')
+  return $installed -and $release -and $release -lt $installed
+}
+
 function Test-VanillaInstall {
   return Test-Path (Join-Path $InstallDir "resources\app-update.yml")
 }
@@ -313,6 +335,12 @@ try {
   if (-not $targetTag) { exit 0 }
   if (-not $vanilla -and $targetTag -eq $state.installedTag) { exit 0 }
   if ($vanilla) { Write-Log "vanilla T3 Code detected over the mods build" }
+  # Never downgrade: a vanilla Nightly can be ahead of the newest mods build, and
+  # its database may already be migrated past what the older build understands.
+  if (Test-OlderThanInstalled $targetTag) {
+    Write-Log ("installed T3 Code {0} is newer than {1}; waiting for a newer mods build" -f (Get-InstalledVersion), $targetTag)
+    exit 0
+  }
   $release = Get-ReleaseFiles $targetTag
 
   if ($Mode -eq "check") {
