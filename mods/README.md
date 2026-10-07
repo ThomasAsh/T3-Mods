@@ -30,7 +30,7 @@ Each mod is one commit on top of the upstream tag, kept in the order of [`mods.j
 | `mods-sync` (release) | Hourly for stable, daily for nightly | Detects a new upstream tag on the followed channel, rebases `main`, verifies, repairs with Claude Code if needed, then builds and publishes |
 | `mods-sync` (canary) | Daily, while following stable | Same against upstream `main`, pushed to `next`; never publishes |
 | `mods-verify` | Push to `main`, `next`, `mod/**`, `repair/**` | Typecheck, tests and lint for what the stack touches |
-| `mods-build` | On demand or from sync | Windows x64 installer, published as a private release |
+| `mods-build` | On demand or from sync | Windows x64 installer, Linux x64 AppImage and Linux x64 server (CLI archive), published as one private release |
 
 The channel is set in [`mods.json`](mods.json) under `upstream`. With `"channel": "nightly"` and `"stableFrom": "0.0.46"`, the stack follows nightlies until v0.0.46 stable is out, then switches to stable releases by itself.
 
@@ -38,9 +38,21 @@ The channel is set in [`mods.json`](mods.json) under `upstream`. With `"channel"
 
 Develop mods on `mod/<name>` branches. Once verify is green, rebase onto `main` and fast-forward.
 
+## Where the builds run
+
+| Machine | Build | Installed by |
+|---|---|---|
+| HD and HDG (headless servers) | Linux x64 server, `t3-<version>-linux-x64.tar.gz` | `t3-auto-update.sh` on each Unraid host (horizon-fleet-manager `t3code/build`) |
+| Windows desktops | `T3-Code-<version>-x64.exe` | `T3ModsUpdater.ps1` (below) |
+| Linux desktops | `T3-Code-<version>-x86_64.AppImage` | `t3-mods-updater.sh` (below) |
+
+Server-side mods (the account router) act on every thread of the server that runs them, so they need the modded **server**; the desktop builds add the client side (the router's switch in Settings). Servers should update first: a server may run ahead of a client, never behind.
+
 ## Local updater
 
-Install it once per machine:
+Install it once per machine.
+
+**Windows:**
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File mods\updater\Install-T3ModsUpdater.ps1
@@ -54,13 +66,23 @@ After that, the scheduled task installs new releases whenever T3 Code is idle. O
 
 Logs are in `%LOCALAPPDATA%\T3ModsUpdater\updater.log`.
 
-Modded installers ship with **no update feed**, so the in-app updater is off and a vanilla build can't replace them. The local updater ([`updater/`](updater)) installs releases instead. Before installing it:
+**Linux** (needs `gh` signed in; installs a systemd user timer, the "T3 Code" launcher and the latest build, and moves vanilla T3 Code AppImages in your home folders to `~/.local/share/t3-mods/vanilla`):
 
-- verifies the release hash
-- backs up userdata
-- waits for idle
+```bash
+gh release download --repo ThomasAsh/T3-Mods --pattern t3-mods-updater.sh --dir /tmp/t3-mods --clobber
+bash /tmp/t3-mods/t3-mods-updater.sh install
+```
 
-After installing, it health-checks the app and rolls back if the check fails.
+Then `t3-mods-updater status|now|rollback|uninstall`; log in `~/.local/share/t3-mods/updater.log`.
+
+Modded desktop builds ship with **no update feed**, so the in-app updater is off and a vanilla build can't replace them. The local updaters ([`updater/`](updater)) install releases instead. Before installing, they:
+
+- verify the release hash
+- never install a build older than the newest T3 Code that machine has run
+- back up userdata
+- wait for idle
+
+After installing, they health-check the app and roll back if the check fails. With *Settings › Connections › Local environment* off (a client-only machine), the check is that the app stays up, since no local server starts.
 
 ## Secrets
 
