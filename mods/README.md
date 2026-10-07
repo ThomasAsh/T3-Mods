@@ -29,14 +29,24 @@ Each mod is one commit on top of the upstream tag, kept in the order of [`mods.j
 |---|---|---|
 | `mods-sync` (release) | Hourly for stable, daily at 06:30 AEST for nightly | Detects a new upstream tag on the followed channel, rebases `main`, verifies, repairs with Claude Code if needed, then builds and publishes |
 | `mods-sync` (canary) | Daily, while following stable | Same against upstream `main`, pushed to `next`; never publishes |
-| `mods-verify` | Push to `main`, `next`, `mod/**`, `repair/**` | Typecheck, tests and lint for what the stack touches |
+| `mods-verify` | Push to any branch | Typecheck, tests and lint for what the stack touches |
 | `mods-build` | On demand or from sync | Windows x64 installer, Linux x64 AppImage and Linux x64 server (CLI archive), published as one private release |
 
 The channel is set in [`mods.json`](mods.json) under `upstream`. With `"channel": "nightly"` and `"stableFrom": "0.0.46"`, the stack follows nightlies until v0.0.46 stable is out, then switches to stable releases by itself.
 
 `next` is derived from `main`. The tag `mods-next-source` records which `main` commit it was built from. A stable sync reuses `next` (and the ports already done there) only while `main` is unchanged and `next`'s upstream base is part of the new release. Otherwise it rebases `main`.
 
-Develop mods on `mod/<name>` branches. Once verify is green, rebase onto `main` and fast-forward.
+## Making changes
+
+Every change goes through a pull request, so GitHub keeps a record of it:
+
+1. Branch from the current `main` (`mod/<name>` by convention) and push. `mods-verify` runs on the push and its result shows on the pull request.
+2. Open a pull request against `main`. Say what changed and why, and how it was verified.
+3. Merge with **Rebase and merge** once verify is green. It is the only merge method the repo allows, so commits land on `main` as they are.
+
+Each mod is one commit in the stack. A change to an existing mod goes in as a `fixup!` commit (`git commit --fixup=<the mod's commit>`); the next upstream sync folds it into that mod with `--autosquash`. A new mod, or a change to the pipeline, is an ordinary commit.
+
+The daily sync rewrites `main`, so merge a pull request the day it is opened. One left open across a sync needs its branch rebased onto the new `main` first (`git rebase --onto origin/main <old main>`).
 
 ## Where the builds run
 
