@@ -3,32 +3,40 @@
   Installs T3-Mods releases over the local T3 Code install.
 
 .DESCRIPTION
-  Run every 30 minutes by the "T3 Mods Updater" scheduled task (see Install-T3ModsUpdater.ps1).
+  Run by two scheduled tasks (registered with -Mode install): "T3 Mods Updater" every
+  10 minutes, and "T3 Mods Updater (wake)" at logon, unlock and resume from sleep.
   Each run:
-    1. Reads the latest private release of the mods repo through the GitHub CLI.
-    2. Reinstalls the mods build if a vanilla T3 Code has replaced it (vanilla ships an
+    1. Reads the latest private release of the mods repo through the GitHub CLI, and takes
+       the updater (and task schedule) that ships with it.
+    2. Waits until every T3 server (-Servers) has marked the release deployed, so this
+       client is never ahead of the servers (after -GateMaxHours it installs anyway).
+    3. Reinstalls the mods build if a vanilla T3 Code has replaced it (vanilla ships an
        update feed in resources\app-update.yml; mods builds never do).
-    3. Downloads the installer and verifies its SHA-256 against the release manifest.
-    4. Waits until T3 Code is idle: not running, or no input for -IdleMinutes with its
-       process tree quiet.
-    5. Backs up userdata (with the database when the upstream version changes), installs
+    4. Downloads the installer and verifies its SHA-256 against the release manifest.
+    5. Waits until T3 Code is idle: not running, or its process tree quiet and no input
+       for -IdleMinutes. In the 15 minutes after a wake only local agents hold it back.
+    6. Backs up userdata (with the database when the upstream version changes), installs
        silently, relaunches, and health-checks the server. If the check fails it reinstalls
        the previous build and skips the bad release.
 
-  Automatic installs start after the first manual install (-Mode now).
-
 .PARAMETER Mode
-  check     Default. Install the latest release when idle.
-  now       Install the latest release immediately; closes T3 Code.
-  rollback  Reinstall the previous build.
-  status    Print the updater state.
+  check      Default. Install the latest release when idle.
+  wake       As check, right after logon, unlock or resume: doesn't wait for input idle.
+  now        Install the latest release immediately; closes T3 Code.
+  rollback   Reinstall the previous build.
+  status     Print the updater state.
+  install    Copy this script to %LOCALAPPDATA%\T3ModsUpdater, register the tasks and the
+             "T3 Mods - Update now" shortcut, then install the latest release now.
+  uninstall  Remove the tasks and the shortcut (downloads, backups and logs are kept).
 #>
 [CmdletBinding()]
 param(
-  [ValidateSet("check", "now", "rollback", "status")]
+  [ValidateSet("check", "wake", "now", "rollback", "status", "install", "uninstall")]
   [string]$Mode = "check",
   [string]$Repo = "ThomasAsh/T3-Mods",
-  [int]$IdleMinutes = 20
+  [int]$IdleMinutes = 20,
+  [string[]]$Servers = @("HD", "HDG"),
+  [int]$GateMaxHours = 12
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,6 +49,12 @@ $DownloadsDir = Join-Path $Root "downloads"
 $BackupsDir = Join-Path $Root "backups"
 $KeepBuilds = 3
 $KeepBackups = 3
+$Script = Join-Path $Root "T3ModsUpdater.ps1"
+$TaskName = "T3 Mods Updater"
+$WakeTaskName = "T3 Mods Updater (wake)"
+# Bump when the tasks change; every run re-registers tasks that carry an older version.
+$TaskVersion = "tasks v2"
+$Shortcut = Join-Path ([Environment]::GetFolderPath("Programs")) "T3 Mods - Update now.lnk"
 
 New-Item -ItemType Directory -Force -Path $Root, $DownloadsDir, $BackupsDir | Out-Null
 
@@ -65,6 +79,19 @@ function Get-State {
 
 function Save-State($State) {
   $State | ConvertTo-Json -Depth 5 | Set-Content -Path $StatePath -Encoding UTF8
+}
+
+# State files written by older updaters lack newer keys; add them on first use.
+function Set-StateValue($State, [string]$Name, $Value) {
+  $State | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+}
+
+# Logs a repeating condition once until it changes.
+function Write-LogOnce($State, [string]$Message) {
+  if ($State.waitingNote -eq $Message) { return }
+  Set-StateValue $State "waitingNote" $Message
+  Save-State $State
+  Write-Log $Message
 }
 
 function Get-GhPath {
@@ -320,6 +347,83 @@ function Install-Release($State, $Release) {
   throw "install of $($Release.Tag) failed and no rollback was possible"
 }
 
+function Register-UpdaterTasks {
+  $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $user = "$env:USERDOMAIN\$env:USERNAME"
+  # conhost --headless runs the script without flashing a console window.
+  $action = { param($mode) New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot "System32\conhost.exe") `
+      -Argument "--headless `"$powershell`" -NoProfile -ExecutionPolicy Bypass -File `"$Script`" -Mode $mode" }
+  $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+  $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+  $description = "Installs T3-Mods builds over T3 Code once the T3 servers run them. See $Root\updater.log. ($TaskVersion)"
+
+  $every10 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 10)
+  Register-ScheduledTask -TaskName $TaskName -Action (& $action "check") -Trigger @($every10) `
+    -Settings $settings -Principal $principal -Force -Description $description | Out-Null
+
+  $atLogon = New-ScheduledTaskTrigger -AtLogOn -User $user
+  $atLogon.Delay = "PT1M"
+  $sessionClass = Get-CimClass -Namespace Root/Microsoft/Windows/TaskScheduler -ClassName MSFT_TaskSessionStateChangeTrigger
+  $atUnlock = New-CimInstance -CimClass $sessionClass -ClientOnly -Property @{ StateChange = 8; UserId = $user; Enabled = $true }
+  $wakeTriggers = @($atLogon, $atUnlock)
+  try {
+    $eventClass = Get-CimClass -Namespace Root/Microsoft/Windows/TaskScheduler -ClassName MSFT_TaskEventTrigger
+    $query = "<QueryList><Query Id='0' Path='System'><Select Path='System'>*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]</Select></Query></QueryList>"
+    $wakeTriggers += New-CimInstance -CimClass $eventClass -ClientOnly -Property @{ Subscription = $query; Enabled = $true; Delay = "PT30S" }
+    Register-ScheduledTask -TaskName $WakeTaskName -Action (& $action "wake") -Trigger $wakeTriggers `
+      -Settings $settings -Principal $principal -Force -Description $description | Out-Null
+  } catch {
+    # Without the resume event, logon and unlock still cover the morning.
+    Write-Log "resume-from-sleep trigger unavailable ($($_.Exception.Message)); using logon and unlock"
+    Register-ScheduledTask -TaskName $WakeTaskName -Action (& $action "wake") -Trigger @($atLogon, $atUnlock) `
+      -Settings $settings -Principal $principal -Force -Description $description | Out-Null
+  }
+
+  $shell = New-Object -ComObject WScript.Shell
+  $link = $shell.CreateShortcut($Shortcut)
+  $link.TargetPath = $powershell
+  $link.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$Script`" -Mode now"
+  $link.WorkingDirectory = $Root
+  $link.Description = "Install the latest T3-Mods build now (closes T3 Code)"
+  $appIcon = Join-Path $InstallDir "T3 Code (Nightly).exe"
+  if (-not (Test-Path $appIcon)) { $appIcon = Join-Path $InstallDir "T3 Code (Alpha).exe" }
+  if (Test-Path $appIcon) { $link.IconLocation = "$appIcon,0" }
+  $link.Save()
+  Write-Log "registered '$TaskName' (every 10 min) and '$WakeTaskName' (logon, unlock, resume) ($TaskVersion)"
+}
+
+function Update-UpdaterTasks {
+  $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+  $wakeTask = Get-ScheduledTask -TaskName $WakeTaskName -ErrorAction SilentlyContinue
+  if (-not $task -or -not $wakeTask -or $task.Description -notlike "*($TaskVersion)*") {
+    Register-UpdaterTasks
+  }
+}
+
+# Each release carries the updater that matches it; take it once per release. The new
+# copy runs from the next trigger on and brings its own task schedule with it.
+function Update-Self($State, [string]$Tag) {
+  if ($State.updaterTag -eq $Tag) { return }
+  $tmp = Join-Path $env:TEMP ("T3ModsUpdater-{0}.ps1" -f [guid]::NewGuid())
+  try {
+    Invoke-Gh @("release", "download", $Tag, "--repo", $Repo, "--pattern", "T3ModsUpdater.ps1", "--output", $tmp, "--clobber") | Out-Null
+    $errors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$null, [ref]$errors)
+    if ($errors.Count -gt 0) { throw "the release's updater does not parse" }
+    if (-not (Test-Path $Script) -or (Get-FileHash $tmp).Hash -ne (Get-FileHash $Script).Hash) {
+      Copy-Item -Force $tmp $Script
+      Write-Log "updated this updater from $Tag (in use from the next run)"
+    }
+    Set-StateValue $State "updaterTag" $Tag
+    Save-State $State
+  } catch {
+    Write-Log "updater self-update skipped: $($_.Exception.Message)"
+  } finally {
+    Remove-Item -Force $tmp -ErrorAction SilentlyContinue
+  }
+}
+
 $mutex = New-Object System.Threading.Mutex($false, "Local\T3ModsUpdater")
 if (-not $mutex.WaitOne(0)) { Write-Host "Another updater run is in progress."; exit 0 }
 try {
@@ -331,6 +435,21 @@ try {
     exit 0
   }
 
+  if ($Mode -eq "uninstall") {
+    foreach ($name in @($TaskName, $WakeTaskName)) {
+      Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Force $Shortcut -ErrorAction SilentlyContinue
+    Write-Log "removed the scheduled tasks and the shortcut; files in $Root were kept"
+    exit 0
+  }
+
+  if ($Mode -eq "install") {
+    if ($PSCommandPath -and ((Resolve-Path $PSCommandPath).Path -ne $Script)) { Copy-Item -Force $PSCommandPath $Script }
+    Register-UpdaterTasks
+    $Mode = "now"
+  }
+
   if ($Mode -eq "rollback") {
     if (-not $state.previousTag) { throw "no previous build recorded" }
     $previousRelease = Get-ReleaseFiles $state.previousTag
@@ -339,12 +458,22 @@ try {
     exit 0
   }
 
-  if ($Mode -eq "check" -and -not $state.enabled) {
+  $automatic = $Mode -eq "check" -or $Mode -eq "wake"
+  # A wake opens a 15-minute window, in case the servers are still taking the release.
+  if ($Mode -eq "wake") { Set-StateValue $state "wokeAt" (Get-Date).ToString("o"); Save-State $state }
+  $justWoke = $Mode -eq "wake" -or ($state.wokeAt -and ((Get-Date) - [datetime]::Parse($state.wokeAt)).TotalMinutes -lt 15)
+  if ($automatic -and -not $state.enabled) {
     Write-Log "automatic installs are off until the first manual install (-Mode now)"
     exit 0
   }
 
-  $latestTag = (Invoke-Gh @("release", "view", "--repo", $Repo, "--json", "tagName", "--jq", ".tagName")).Trim()
+  $releaseInfo = @(Invoke-Gh @("release", "view", "--repo", $Repo, "--json", "tagName,publishedAt,assets",
+      "--jq", ".tagName, .publishedAt, .assets[].name") | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+  $latestTag = $releaseInfo[0]
+  $publishedAt = [datetime]::Parse($releaseInfo[1]).ToUniversalTime()
+  $assets = @($releaseInfo | Select-Object -Skip 2)
+  Update-Self $state $latestTag
+  if ($automatic) { Update-UpdaterTasks }
   # A release that failed its health check is skipped until a newer one is published.
   $targetTag = if (@($state.badTags) -contains $latestTag) { $state.installedTag } else { $latestTag }
   $vanilla = Test-VanillaInstall
@@ -354,17 +483,33 @@ try {
   # Never downgrade: a vanilla Nightly can be ahead of the newest mods build, and
   # its database may already be migrated past what the older build understands.
   if (Test-OlderThanInstalled $targetTag) {
-    Write-Log ("installed T3 Code {0} is newer than {1}; waiting for a newer mods build" -f (Get-InstalledVersion), $targetTag)
+    Write-LogOnce $state ("installed T3 Code {0} is newer than {1}; waiting for a newer mods build" -f (Get-InstalledVersion), $targetTag)
     exit 0
+  }
+  # Servers first: a client ahead of its servers gets "server out of date" everywhere.
+  $missing = @($Servers | Where-Object { $assets -notcontains "deployed-$_.txt" })
+  if ($targetTag -eq $latestTag -and $missing.Count -gt 0) {
+    $ageHours = [int]((Get-Date).ToUniversalTime() - $publishedAt).TotalHours
+    if ($Mode -eq "now") {
+      Write-Log ("installing {0} before {1} took it (now)" -f $targetTag, ($missing -join ", "))
+    } elseif ($ageHours -lt $GateMaxHours) {
+      Write-LogOnce $state ("{0} is out; waiting for {1} to take it first" -f $targetTag, ($missing -join ", "))
+      exit 0
+    } else {
+      Write-Log ("{0} still not on {1} after {2} h; installing anyway" -f ($missing -join ", "), $targetTag, $ageHours)
+    }
   }
   $release = Get-ReleaseFiles $targetTag
 
-  if ($Mode -eq "check") {
+  if ($automatic) {
     $running = Get-T3Processes
     if ($running.Count -gt 0) {
+      # Just after a wake (logon, unlock, resume) only local agents hold the update back;
+      # a client-only machine has none, and its own reconnect burst isn't work.
       $idle = [T3ModsIdle]::Minutes()
-      if ($idle -lt $IdleMinutes -or (Test-T3Busy $running)) {
-        Write-Log ("{0} ready; waiting for idle (input idle {1:N0} min)" -f $release.Tag, $idle)
+      $waiting = if ($justWoke) { (Test-LocalEnvironmentEnabled) -and (Test-T3Busy $running) } else { $idle -lt $IdleMinutes -or (Test-T3Busy $running) }
+      if ($waiting) {
+        Write-LogOnce $state ("{0} ready; waiting for T3 Code to be idle" -f $release.Tag)
         if ($state.notifiedTag -ne $release.Tag) {
           $state.notifiedTag = $release.Tag
           Save-State $state
