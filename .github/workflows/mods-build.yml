@@ -371,6 +371,10 @@ jobs:
     needs: [bundle, windows, linux]
     if: inputs.publish
     runs-on: ubuntu-latest
+    # Repo-wide, so two builds never take the same build number.
+    concurrency:
+      group: mods-publish
+      cancel-in-progress: false
     timeout-minutes: 15
     env:
       VERSION: ${{ needs.bundle.outputs.version }}
@@ -401,12 +405,25 @@ jobs:
           name: linux-x64
           path: release
 
+      # One sequence for every build: github.run_number is the caller's counter when
+      # mods-sync calls this workflow, and this workflow's own when run by hand.
+      - name: Allocate build number
+        id: number
+        shell: bash
+        run: |
+          set -euo pipefail
+          last="$(git ls-remote --tags origin 'refs/tags/mods-v*' \
+            | sed -nE 's#.*refs/tags/mods-v.+-([0-9]+)$#\1#p' | sort -n | tail -1)"
+          build=$(( ${last:-0} + 1 ))
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "Build number $build"
+
       - name: Write release manifest
         shell: bash
         run: |
           set -euo pipefail
           find release -type f | sort
-          node mods/scripts/manifest.mjs "$VERSION" "$UPSTREAM_TAG" "$SHA" "${{ github.run_number }}" \
+          node mods/scripts/manifest.mjs "$VERSION" "$UPSTREAM_TAG" "$SHA" "${{ steps.number.outputs.build }}" \
             --installer "$(find release -name '*.exe' | head -1)" \
             --appimage "$(find release -name '*.AppImage' | head -1)" \
             --server "$(find release -name "t3-${VERSION}-linux-x64.tar.gz" | head -1)" \
@@ -419,11 +436,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="mods-v${VERSION}-${{ github.run_number }}"
+          tag="mods-v${VERSION}-${{ steps.number.outputs.build }}"
           node mods/scripts/release-notes.mjs "$UPSTREAM_TAG" "$SHA" > notes.md
           gh release create "$tag" \
             $(find release -type f \( -name '*.exe' -o -name '*.AppImage' -o -name '*.tar.gz' \)) \
             mods-manifest.json mods/updater/T3ModsUpdater.ps1 mods/updater/t3-mods-updater.sh \
             --repo "$GITHUB_REPOSITORY" --target "$SHA" \
-            --title "T3 Code ${VERSION} + mods (#${{ github.run_number }})" \
+            --title "T3 Code ${VERSION} + mods (#${{ steps.number.outputs.build }})" \
             --notes-file notes.md --latest
