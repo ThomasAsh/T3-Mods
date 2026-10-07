@@ -3,7 +3,7 @@
 Personal mods for T3 Code, kept alive across upstream updates by an auto-rebasing,
 self-repairing build pipeline.
 
-Status: **confirmed 2026-10-05, updated 2026-10-06**. Decisions in section 9.
+Status: **confirmed 2026-10-05, updated 2026-10-07**. Decisions in section 9.
 
 ---
 
@@ -32,8 +32,7 @@ The repo holds the full t3code history plus our branches:
 - `mods/next`: upstream `main` plus the mod stack, as a canary. Ports get done here before the next stable ships.
 - The mod stack is an ordered series of commits, one per mod:
   0. `fork-hygiene`: remove upstream release, deploy and mobile workflows; add ours. Build config: no upstream update feed, keep T3 Connect public IDs.
-  1. `mod-agents-bottom-panel`
-  2. `mod-account-router`
+  1. `mod-account-router`
 - Rules that keep rebases cheap:
   - Most of each mod's code lives in **new files** (`apps/web/src/mods/…`, `apps/server/src/mods/…`).
   - Upstream files only get thin hook edits.
@@ -57,12 +56,12 @@ upstream stable tag ─▶ rebase stack ─▶ verify ─▶ (repair ⟲ verify)
    - Claude Code runs headless in the worktree with a scoped prompt: `INTENT.md`, the failing output, and the upstream diff.
    - It gets up to 3 attempts, re-verifying after each.
    - Work goes on a `repair/<tag>` branch with a PR, auto-merged when green.
-5. **Build** Windows x64 NSIS:
-   - Unsigned, with **no update feed**, so the in-app updater is off and vanilla can't overwrite it.
-   - Same appId, install dir and data dir as the official app.
+5. **Build** three artifacts from one JS bundle:
+   - Windows x64 NSIS installer and Linux x64 AppImage: unsigned, with **no update feed**, so the in-app updater is off and vanilla can't overwrite them. Same appId, install dir and data dir as the official app.
+   - Linux x64 CLI archive: the headless server the HD/HDG containers run. Server-side mods (the router) only act where the server runs them, so the servers need this build; a tripwire fails the build if the router is missing from it.
    - The version string stays identical to upstream, which keeps provider compatibility ranges and remote/SSH server updates working. The mod build ID is recorded separately and shown in Settings › About.
-6. **Publish** a private GitHub Release with the installer, sha512 and mods manifest.
-7. **Install** with the local *T3 Mods Updater*, a Windows scheduled task that uses your existing `gh` login. It:
+6. **Publish** a private GitHub Release with all three, the mods manifest (SHA-256 of each) and both updater scripts.
+7. **Install.** The servers' `t3-auto-update.sh` installs the CLI archive into the image (hourly check, idle-aware, rollback). Desktops use the local *T3 Mods Updater*: a Windows scheduled task (`T3ModsUpdater.ps1`) or a Linux systemd user timer (`t3-mods-updater.sh`), both using your existing `gh` login. It:
    - Downloads the release and verifies the hash.
    - **Backs up userdata** (settings, keybindings, DB snapshot) before any upstream version bump. This matters for the one-way v0.0.46 migration.
    - Waits until no turns are running, then installs silently and relaunches.
@@ -76,16 +75,9 @@ Safety rails:
 - The pipeline never writes to `~/.t3/userdata` itself.
 - If something reinstalls vanilla (e.g. `winget upgrade --all`), the updater notices the missing mods marker and reinstalls the modded build. Recommend `winget pin add T3Tools.T3Code`.
 
-## 4. Mod 1: Agents in the bottom panel
+## 4. Mod 1: Agents in the bottom panel (dropped 2026-10-07)
 
-- The bottom drawer gets a slim tab strip: **Terminal** | **Agents ●n**, where n counts the current turn's working subagents.
-  - Terminal tabs and splits work exactly as before.
-  - Terminals stay mounted (PTYs alive) while Agents is showing.
-- **Agents** hosts upstream's lineage panel (`ThreadRelationshipsPanel`): running and previous subagents, forks and parents. The new orchestrator deleted the old right-panel Agents surface; this panel is its upstream successor, so the mod hosts it rather than keeping a copy.
-- Setting: *Settings › General › Agents in bottom panel*, on by default.
-- The drawer can open on Agents with **no terminal and no project**.
-- `Ctrl+Alt+J` toggles Agents (client-only, so a vanilla or remote server still works). Active tab and height persist per thread.
-- Mobile isn't affected (it has no bottom panel, and has its own Agents sheet).
+Shipped from v0.0.45 to the 2735 nightly, then dropped: upstream nightly's own additions made it redundant. Its commit is gone from the stack; tag `mods-v0.0.46-nightly.20261006.2735-9` still has it.
 
 ## 5. Mod 2: Account auto-router
 
@@ -120,7 +112,7 @@ Safety rails:
 | Phase | Deliverable | Ships on |
 |---|---|---|
 | 0. Foundation | Repo, CI pipeline (rebase, verify, repair, build, publish), local updater with backup and rollback | done |
-| 1. Agents bottom tab | Mod 1 | v0.0.45 build, then ported to the nightlies |
+| 1. Agents bottom tab | Mod 1 | v0.0.45 to the 2735 nightly; dropped 2026-10-07 |
 | 2. Router | Mod 2 | nightly builds now (channel decision below) |
 | 3. Tuning | Review a week of router decisions in the server log; tune thresholds | — |
 
@@ -136,6 +128,6 @@ Safety rails:
 |---|---|
 | Account pool | Pools are **per provider**: HDG + EAP form the Claude pool. Codex stays as it is today (one account, so nothing to route). Any new Claude or Codex instance joins its provider's pool automatically. The router never switches provider or model. `claudeAgent_hdg1` in favourites is stale. |
 | Build host | **GitHub Actions** in the private repo. AI repair uses a `CLAUDE_CODE_OAUTH_TOKEN` repo secret (from `claude setup-token`). |
-| Router timing | Built on `next` against the new orchestrator; ships with **v0.0.46 stable**. Mod 1 ships on v0.0.45 now. |
-| Agents layout | **Tabs**: Terminal \| Agents ●n in the bottom drawer. |
+| Router timing | Built on `next` against the new orchestrator; shipped on the nightlies. |
 | Channel (2026-10-06) | The installed app moved to the Nightly channel, whose data migration can't be undone. Builds follow **upstream nightlies** (one build a day) until v0.0.46 stable ships, then follow stable releases automatically (`mods.json` `upstream`). |
+| Where mods run (2026-10-07) | The router acts in the server that owns a thread, so **HD and HDG run the modded server** (Linux CLI archive) instead of npm `t3`; until then it routed nothing on them. **Desktop clients stay modded** (PC on Windows, laptop on Linux) for the router's switch in Settings. The Agents tab mod is dropped. |
