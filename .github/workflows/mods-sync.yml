@@ -2,8 +2,9 @@ name: Mods · Sync upstream
 
 # Keeps the mod stack on top of upstream (mods/scripts/sync.mjs):
 #   release  a new upstream tag on the followed channel → rebase main, verify, repair,
-#            build, publish. Stable is checked hourly; nightly once a day (05:23 AEST),
-#            so a busy nightly day still produces one build.
+#            build, publish. Stable is checked hourly; nightly once a day (06:30 AEST,
+#            Tom's quietest hour), so a busy nightly day still produces one build. The
+#            servers take it within minutes and the desktops after them.
 #   canary   daily: upstream main → rebase onto `next`, verify, repair; never publishes.
 #            Skipped while following nightlies, which are already cut from main.
 # The channel comes from mods/mods.json `upstream` (see mods/scripts/upstream.mjs).
@@ -13,7 +14,7 @@ name: Mods · Sync upstream
 on:
   schedule:
     - cron: "17 * * * *"
-    - cron: "23 19 * * *"
+    - cron: "30 20 * * *"
     - cron: "41 19 * * *"
   workflow_dispatch:
     inputs:

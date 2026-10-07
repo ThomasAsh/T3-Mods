@@ -4,25 +4,33 @@
 # T3ModsUpdater.ps1.
 #
 #   t3-mods-updater.sh install    once per machine: install this script, a systemd user
-#                                 timer (every 30 min and 5 min after login), the
+#                                 timer (every 10 min and 2 min after login), the
 #                                 "T3 Code" launcher, and the latest build
-#   t3-mods-updater.sh check      what the timer runs: install the latest release when idle
+#   t3-mods-updater.sh check      what the timer runs: install the latest release when idle,
+#                                 or straight away in the first minutes after a wake
 #   t3-mods-updater.sh now        install the latest release now (closes T3 Code)
 #   t3-mods-updater.sh rollback   reinstall the previous build
 #   t3-mods-updater.sh status     print the updater state
 #   t3-mods-updater.sh uninstall  remove the timer and launcher (keeps the app and backups)
 #
 # Needs the GitHub CLI (gh) signed in to an account that can read the private repo.
-# Each run reads the latest release, verifies the AppImage's SHA-256 against the
+# Each run reads the latest release and waits until every T3 server (T3MODS_SERVERS)
+# has marked it deployed, so this client is never ahead of the servers (after
+# GATE_MAX_HOURS it installs anyway). It verifies the AppImage's SHA-256 against the
 # release manifest, never installs a build older than the newest T3 Code this user has
-# run (the database migrates one way), waits until T3 Code is idle, backs up userdata,
-# swaps the AppImage, and health-checks it, rolling back if the check fails.
+# run (the database migrates one way), waits until T3 Code is idle (right after a wake
+# from sleep or a login it only waits for running agents), backs up userdata, swaps the
+# AppImage, and health-checks it, rolling back if the check fails. Each new release also
+# brings the matching version of this script and its timer.
 #
 # Logs: ~/.local/share/t3-mods/updater.log
 set -euo pipefail
 
 REPO="${T3MODS_REPO:-ThomasAsh/T3-Mods}"
 IDLE_MINUTES="${T3MODS_IDLE_MINUTES:-20}"
+SERVERS="${T3MODS_SERVERS:-HD HDG}"
+GATE_MAX_HOURS=12
+WAKE_WINDOW_MINUTES=15
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 ROOT="$DATA_HOME/t3-mods"
 APP="$ROOT/app/T3-Code.AppImage"
@@ -51,16 +59,19 @@ log() {
   echo "$line" >&2
   if [ "$(stat -c %s "$LOG")" -gt 1048576 ]; then mv -f "$LOG" "$LOG.1"; fi
 }
+note_once() { [ "$waiting_note" = "$1" ] && return 0; waiting_note="$1"; save_state; log "$1"; }
 notify() { command -v notify-send > /dev/null && notify-send -a "T3 Mods Updater" "$1" "$2" 2> /dev/null || true; }
 die() { log "error: $*"; exit 1; }
 
 # --- state (key=value, sourced) -------------------------------------------------------
 enabled=0 installed_tag="" installed_version="" previous_tag="" bad_tags="" notified_tag="" highest_version=""
+updater_tag="" last_boot="" last_suspended=0 woke_at=0 waiting_note=""
 # shellcheck source=/dev/null
 [ -f "$STATE" ] && . "$STATE"
 save_state() {
   local key
-  for key in enabled installed_tag installed_version previous_tag bad_tags notified_tag highest_version; do
+  for key in enabled installed_tag installed_version previous_tag bad_tags notified_tag highest_version \
+    updater_tag last_boot last_suspended woke_at waiting_note; do
     printf '%s=%q\n' "$key" "${!key}"
   done > "$STATE.tmp"
   mv -f "$STATE.tmp" "$STATE"
@@ -166,8 +177,9 @@ t3_busy() { # agents probably mid-turn: the T3 process tree burned CPU over 20 s
   before="$(cpu_ticks "$@")"
   sleep 20
   after="$(cpu_ticks "$@")"
-  log "T3 process tree used $(((after - before) * 10 / hz))/10 s CPU in 20 s"
-  [ $(((after - before) * 10 / hz)) -gt 20 ]
+  local tenths=$(((after - before) * 10 / hz))
+  log "T3 process tree used $((tenths / 10)).$((tenths % 10)) s CPU in 20 s"
+  [ "$tenths" -gt 20 ]
 }
 user_idle_minutes() { # -1 when this desktop doesn't say
   local value
@@ -406,36 +418,45 @@ retire_vanilla() {
 }
 
 # --- scheduling -------------------------------------------------------------------------
+# Idempotent: every run brings the timer in line with this script, so a new release can
+# change the schedule without a reinstall.
 install_timer() {
+  local service timer
   if systemctl --user show-environment > /dev/null 2>&1; then
-    mkdir -p "$UNIT_DIR"
-    cat > "$UNIT_DIR/t3-mods-updater.service" << EOF
-[Unit]
+    service="[Unit]
 Description=T3 Mods Updater (installs T3-Mods builds of T3 Code when idle)
 
 [Service]
 Type=oneshot
-ExecStart=$SELF check
-EOF
-    cat > "$UNIT_DIR/t3-mods-updater.timer" << EOF
-[Unit]
-Description=Check for T3-Mods builds every 30 minutes
+ExecStart=$SELF check"
+    # Calendar timers that elapsed during sleep fire on resume, so a wake is seen at once.
+    timer="[Unit]
+Description=Check for T3-Mods builds every 10 minutes
 
 [Timer]
-OnStartupSec=5min
-OnCalendar=*:0/30
-RandomizedDelaySec=2min
+OnStartupSec=2min
+OnCalendar=*:0/10
+RandomizedDelaySec=30s
 Persistent=true
 
 [Install]
-WantedBy=timers.target
-EOF
+WantedBy=timers.target"
+    if [ "$(cat "$UNIT_DIR/t3-mods-updater.service" 2> /dev/null)" = "$service" ] \
+      && [ "$(cat "$UNIT_DIR/t3-mods-updater.timer" 2> /dev/null)" = "$timer" ] \
+      && systemctl --user is-enabled t3-mods-updater.timer > /dev/null 2>&1; then
+      return 0
+    fi
+    mkdir -p "$UNIT_DIR"
+    printf '%s\n' "$service" > "$UNIT_DIR/t3-mods-updater.service"
+    printf '%s\n' "$timer" > "$UNIT_DIR/t3-mods-updater.timer"
     systemctl --user daemon-reload
-    systemctl --user enable --now t3-mods-updater.timer > /dev/null
-    log "installed the t3-mods-updater systemd user timer (every 30 min and 5 min after login)"
+    systemctl --user enable --now t3-mods-updater.timer > /dev/null 2>&1 || true
+    systemctl --user restart t3-mods-updater.timer > /dev/null 2>&1 || true
+    log "set the t3-mods-updater systemd user timer (every 10 min, 2 min after login, and on wake)"
   elif command -v crontab > /dev/null; then
-    (crontab -l 2> /dev/null | grep -v 't3-mods-updater'; echo "*/30 * * * * $SELF check > /dev/null 2>&1") | crontab -
-    log "installed a crontab entry (every 30 min); no systemd user session found"
+    crontab -l 2> /dev/null | grep -qxF "*/10 * * * * $SELF check > /dev/null 2>&1" && return 0
+    (crontab -l 2> /dev/null | grep -v 't3-mods-updater'; echo "*/10 * * * * $SELF check > /dev/null 2>&1") | crontab -
+    log "set a crontab entry (every 10 min); no systemd user session found"
   else
     log "no systemd user session and no crontab: nothing will run 't3-mods-updater check' automatically"
   fi
@@ -450,6 +471,53 @@ uninstall_timer() {
     crontab -l | grep -v 't3-mods-updater' | crontab -
   fi
   return 0
+}
+
+# --- wake, self-update, server gate -----------------------------------------------------
+# A new boot, or more time asleep than at the last run, means the machine just woke up.
+# For the next WAKE_WINDOW_MINUTES an update doesn't wait for input idle, so it lands
+# before the day's work starts.
+detect_wake() {
+  local boot suspended now
+  boot="$(cat /proc/sys/kernel/random/boot_id 2> /dev/null || true)"
+  suspended="$(python3 -c 'import time; print(int(time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)))' 2> /dev/null || echo 0)"
+  now="$(date +%s)"
+  if [ "$boot" != "$last_boot" ] || [ $((suspended - last_suspended)) -ge 5 ]; then
+    [ -n "$last_boot" ] && woke_at="$now"
+  fi
+  last_boot="$boot" last_suspended="$suspended"
+  save_state
+}
+just_woke() { [ $(($(date +%s) - woke_at)) -lt $((WAKE_WINDOW_MINUTES * 60)) ]; }
+
+# Each release carries the updater that matches it; take it once per release and rerun.
+self_update() {
+  local tmp
+  [ "$updater_tag" = "$1" ] && return 0
+  tmp="$(mktemp)"
+  if gh_cmd release download "$1" --repo "$REPO" --pattern t3-mods-updater.sh --output "$tmp" --clobber > /dev/null 2>&1 \
+    && bash -n "$tmp"; then
+    updater_tag="$1"
+    save_state
+    if [ -f "$SELF" ] && ! cmp -s "$tmp" "$SELF"; then
+      install -m 0755 "$tmp" "$SELF"
+      rm -f "$tmp"
+      log "updated this updater from $1"
+      if [ -z "${T3MODS_REEXEC:-}" ]; then
+        exec 9>&-
+        exec env T3MODS_REEXEC=1 bash "$SELF" "$mode"
+      fi
+    fi
+  fi
+  rm -f "$tmp"
+}
+
+# Servers from SERVERS that have not marked the release deployed (deployed-<name>.txt).
+servers_missing() { # servers_missing <asset names>
+  local server
+  for server in $SERVERS; do
+    grep -qx "deployed-$server.txt" <<< "$1" || printf '%s ' "$server"
+  done
 }
 
 # --- main -------------------------------------------------------------------------------
@@ -508,7 +576,14 @@ if [ "$mode" = check ] && [ "$enabled" != 1 ]; then
   exit 0
 fi
 
-latest="$(gh_cmd release view --repo "$REPO" --json tagName --jq .tagName)"
+detect_wake
+release="$(gh_cmd release view --repo "$REPO" --json tagName,publishedAt,assets --jq '.tagName, .publishedAt, .assets[].name')"
+latest="$(sed -n 1p <<< "$release")"
+published="$(date -d "$(sed -n 2p <<< "$release")" +%s 2> /dev/null || date +%s)"
+assets="$(tail -n +3 <<< "$release")"
+[ -n "$latest" ] || exit 0
+self_update "$latest"
+[ "$mode" = check ] && install_timer
 target="$latest"
 [[ " $bad_tags " == *" $latest "* ]] && target="$installed_tag"
 [ -n "$target" ] || exit 0
@@ -516,8 +591,21 @@ if [ "$target" = "$installed_tag" ] && [ -f "$APP" ]; then exit 0; fi
 # Never downgrade: a vanilla Nightly can be ahead of the newest mods build, and its
 # database may already be migrated past what the older build understands.
 if [ -n "$highest_version" ] && version_lt "$(tag_version "$target")" "$highest_version"; then
-  log "T3 Code $highest_version has run here, newer than $target; waiting for a newer mods build"
+  note_once "T3 Code $highest_version has run here, newer than $target; waiting for a newer mods build"
   exit 0
+fi
+# Servers first: a client ahead of its servers gets "server out of date" everywhere.
+missing="$(servers_missing "$assets")"
+if [ -n "$missing" ]; then
+  age_hours=$((($(date +%s) - published) / 3600))
+  if [ "$mode" = now ]; then
+    log "installing $target before ${missing}took it (now)"
+  elif [ "$age_hours" -lt "$GATE_MAX_HOURS" ]; then
+    note_once "$target is out; waiting for ${missing}to take it first"
+    exit 0
+  else
+    log "${missing}still not on $target after $age_hours h; installing anyway"
+  fi
 fi
 dir="$(release_files "$target")"
 
@@ -526,9 +614,19 @@ if [ "$mode" = check ]; then
   if [ "${#running[@]}" -gt 0 ]; then
     capture_gui_env "${running[@]}"
     for entry in "${GUI_ENV[@]}"; do export "${entry?}"; done
-    idle="$(user_idle_minutes)"
-    if [ "$idle" -lt "$IDLE_MINUTES" ] || t3_busy "${running[@]}"; then
-      log "$target ready; waiting for idle (input idle ${idle} min; -1 = unknown)"
+    if just_woke; then
+      # Only local agents hold a wake update back; a client-only machine has none, and
+      # the app's own reconnect burst after a resume isn't work.
+      idle="just woke"
+      busy_now=0
+      local_environment_enabled && t3_busy "${running[@]}" && busy_now=1
+    else
+      idle="$(user_idle_minutes)"
+      busy_now=0
+      { [ "$idle" -lt "$IDLE_MINUTES" ] || t3_busy "${running[@]}"; } && busy_now=1
+    fi
+    if [ "$busy_now" = 1 ]; then
+      note_once "$target ready; waiting for T3 Code to be idle (input idle: ${idle}; -1 = unknown)"
       if [ "$notified_tag" != "$target" ]; then
         notified_tag="$target"
         save_state
