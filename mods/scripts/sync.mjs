@@ -58,8 +58,23 @@ function fetchUpstream(target) {
     "+refs/heads/main:refs/remotes/upstream/main",
     ...[...tags].map((tag) => `+refs/tags/${tag}:refs/upstream-tags/${tag}`),
   ];
-  git("fetch", "--quiet", "--filter=blob:none", "--no-tags", UPSTREAM_URL, ...refspecs);
+  // The clone is partial: blobs are fetched when a rebase first needs them, from the
+  // promisor remotes. origin (the fork) lacks upstream's newer objects, so upstream must
+  // be one too, or a replayed commit fails to read them (7 Oct 2026: that dropped the
+  // account router from main).
+  if (tryGit("remote", "get-url", "upstream") === null) git("remote", "add", "upstream", UPSTREAM_URL);
+  else git("remote", "set-url", "upstream", UPSTREAM_URL);
+  git("config", "remote.upstream.promisor", "true");
+  git("config", "remote.upstream.partialclonefilter", "blob:none");
+  git("fetch", "--quiet", "--filter=blob:none", "--no-tags", "upstream", ...refspecs);
 }
+
+/** Files a commit touches. */
+const filesOf = (commit) =>
+  git("diff-tree", "--no-commit-id", "--name-only", "-r", "--root", commit).split("\n").filter(Boolean);
+/** Upstream workflow files: the only changes the sync may drop on its own. */
+const onlyUpstreamWorkflows = (files) =>
+  files.length > 0 && files.every((file) => file.startsWith(".github/workflows/") && !file.includes("/mods-"));
 
 function stackOf(branch) {
   const commits = git(
@@ -105,8 +120,19 @@ function continueRebase() {
     if (!rebaseInProgress()) return [];
     const remaining = autoResolveConflicts();
     if (remaining.length > 0) return remaining;
-    // A step that resolves to no change was already applied upstream.
+    // A step that resolves to no change was already applied upstream, or only touched
+    // upstream workflows the fork drops. Anything else that stops with nothing staged
+    // failed (a missing object, say) and must never be skipped silently.
     const nothingStaged = git("status", "--porcelain", "--untracked-files=no") === "";
+    if (nothingStaged) {
+      const files = filesOf("REBASE_HEAD");
+      const applied = files.length === 0 || tryGit("diff", "--quiet", "HEAD", "REBASE_HEAD", "--", ...files) !== null;
+      if (!applied && !onlyUpstreamWorkflows(files)) {
+        throw new Error(
+          `rebase stopped on ${git("log", "-1", "--format=%h %s", "REBASE_HEAD")} with nothing staged; refusing to drop it`,
+        );
+      }
+    }
     try {
       run("git", ["rebase", nothingStaged ? "--skip" : "--continue"], {
         env: { ...process.env, GIT_EDITOR: "true" },
@@ -166,6 +192,18 @@ function main() {
   if (remaining.length === 0 && strays.length > 0) {
     git("rm", "--quiet", ...strays);
     git("commit", "--quiet", "-m", `chore(mods): drop upstream workflows added in ${target}`);
+  }
+
+  // Tripwire: every commit of the stack must still be there, except ones that only
+  // touched upstream workflows.
+  if (remaining.length === 0) {
+    const after = new Set(git("log", "--format=%s", `${targetSha}..HEAD`).split("\n"));
+    const lost = source.commits.filter(
+      (commit) => !after.has(git("log", "-1", "--format=%s", commit)) && !onlyUpstreamWorkflows(filesOf(commit)),
+    );
+    if (lost.length > 0) {
+      throw new Error(`the rebase lost ${lost.map((commit) => git("log", "-1", "--format=%h %s", commit)).join("; ")}`);
+    }
   }
 
   if (remaining.length > 0) {
