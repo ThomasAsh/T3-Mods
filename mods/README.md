@@ -27,7 +27,7 @@ Each mod is one commit on top of the upstream tag, kept in the order of [`mods.j
 
 | Workflow | When | What |
 |---|---|---|
-| `mods-sync` (release) | Hourly for stable, daily for nightly | Detects a new upstream tag on the followed channel, rebases `main`, verifies, repairs with Claude Code if needed, then builds and publishes |
+| `mods-sync` (release) | Hourly for stable, daily at 06:30 AEST for nightly | Detects a new upstream tag on the followed channel, rebases `main`, verifies, repairs with Claude Code if needed, then builds and publishes |
 | `mods-sync` (canary) | Daily, while following stable | Same against upstream `main`, pushed to `next`; never publishes |
 | `mods-verify` | Push to `main`, `next`, `mod/**`, `repair/**` | Typecheck, tests and lint for what the stack touches |
 | `mods-build` | On demand or from sync | Windows x64 installer, Linux x64 AppImage and Linux x64 server (CLI archive), published as one private release |
@@ -46,7 +46,9 @@ Develop mods on `mod/<name>` branches. Once verify is green, rebase onto `main` 
 | Windows desktops | `T3-Code-<version>-x64.exe` | `T3ModsUpdater.ps1` (below) |
 | Linux desktops | `T3-Code-<version>-x86_64.AppImage` | `t3-mods-updater.sh` (below) |
 
-Server-side mods (the account router) act on every thread of the server that runs them, so they need the modded **server**; the desktop builds add the client side (the router's switch in Settings). Servers should update first: a server may run ahead of a client, never behind.
+Server-side mods (the account router) act on every thread of the server that runs them, so they need the modded **server**; the desktop builds add the client side (the router's switch in Settings).
+
+**Servers first.** A client ahead of its servers gets "server out of date" on every environment. The servers check every 5 minutes and, once a server runs a release, it uploads `deployed-<HD|HDG>.txt` to that release. The desktop updaters install a release only when every server has (after 12 hours they install anyway), so a new build reaches the servers within minutes and the desktops right after.
 
 ## Local updater
 
@@ -55,18 +57,19 @@ Install it once per machine.
 **Windows:**
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File mods\updater\Install-T3ModsUpdater.ps1
-& "$env:LOCALAPPDATA\T3ModsUpdater\T3ModsUpdater.ps1" -Mode now   # first install; closes T3 Code
+gh release download --repo ThomasAsh/T3-Mods --pattern T3ModsUpdater.ps1 --dir $env:TEMP\t3-mods --clobber
+powershell -NoProfile -ExecutionPolicy Bypass -File $env:TEMP\t3-mods\T3ModsUpdater.ps1 -Mode install
 ```
 
-After that, the scheduled task installs new releases whenever T3 Code is idle. Other modes:
+This registers "T3 Mods Updater" (every 10 minutes) and "T3 Mods Updater (wake)" (logon, unlock, resume from sleep) and installs the latest build (closing T3 Code if needed). In the 15 minutes after a wake an update only waits for local agents, not for you to be idle, so it lands before the day's work. Other modes:
 
 - `-Mode status` shows the current state.
 - `-Mode rollback` restores the previous build.
+- `-Mode uninstall` removes the tasks.
 
 Logs are in `%LOCALAPPDATA%\T3ModsUpdater\updater.log`.
 
-**Linux** (needs `gh` signed in; installs a systemd user timer, the "T3 Code" launcher and the latest build, and moves vanilla T3 Code AppImages in your home folders to `~/.local/share/t3-mods/vanilla`):
+**Linux** (needs `gh` signed in; installs a systemd user timer that runs every 10 minutes and on wake, the "T3 Code" launcher and the latest build, and moves vanilla T3 Code AppImages in your home folders to `~/.local/share/t3-mods/vanilla`):
 
 ```bash
 gh release download --repo ThomasAsh/T3-Mods --pattern t3-mods-updater.sh --dir /tmp/t3-mods --clobber
@@ -77,6 +80,8 @@ Then `t3-mods-updater status|now|rollback|uninstall`; log in `~/.local/share/t3-
 
 Modded desktop builds ship with **no update feed**, so the in-app updater is off and a vanilla build can't replace them. The local updaters ([`updater/`](updater)) install releases instead. Before installing, they:
 
+- take the updater that ships with the new release (and its schedule)
+- wait for the servers (above)
 - verify the release hash
 - never install a build older than the newest T3 Code that machine has run
 - back up userdata
