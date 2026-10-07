@@ -217,7 +217,21 @@ function Backup-UserData([string]$Label, [bool]$IncludeDatabase) {
     Select-Object -Skip $KeepBackups | Remove-Item -Recurse -Force
 }
 
+# With Settings > Connections > Local environment off, the app is a client only and
+# starts no server, so health means the app is still up a while after launch.
+function Test-LocalEnvironmentEnabled {
+  $path = Join-Path $UserData "desktop-settings.json"
+  if (-not (Test-Path $path)) { return $true }
+  try { return (Get-Content $path -Raw | ConvertFrom-Json).localEnvironmentEnabled -ne $false } catch { return $true }
+}
+
 function Test-Health([datetime]$SinceUtc) {
+  if (-not (Test-LocalEnvironmentEnabled)) {
+    Start-Sleep -Seconds 45
+    $alive = (Get-T3Processes).Count -gt 0
+    Write-Log ("client-only health check: T3 Code {0}" -f $(if ($alive) { "is running" } else { "exited" }))
+    return $alive
+  }
   $runtimePath = Join-Path $UserData "server-runtime.json"
   $deadline = (Get-Date).AddMinutes(3)
   while ((Get-Date) -lt $deadline) {
@@ -242,7 +256,9 @@ function Get-ReleaseFiles([string]$Tag) {
   if (-not (Test-Path $manifestPath)) {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     Write-Log "downloading $Tag"
-    Invoke-Gh @("release", "download", $Tag, "--repo", $Repo, "--dir", $dir, "--clobber") | Out-Null
+    # Windows assets only; releases also carry the Linux AppImage and server archive.
+    Invoke-Gh @("release", "download", $Tag, "--repo", $Repo, "--dir", $dir, "--clobber",
+      "--pattern", "*.exe", "--pattern", "mods-manifest.json", "--pattern", "T3ModsUpdater.ps1") | Out-Null
   }
   $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
   $installer = Join-Path $dir $manifest.installer.name
