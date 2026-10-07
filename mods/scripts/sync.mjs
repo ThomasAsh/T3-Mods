@@ -180,7 +180,12 @@ function main() {
 
   let remaining = [];
   try {
-    git("rebase", "--quiet", "--onto", targetSha, source.base);
+    // Autosquash folds `fixup!` commits merged through pull requests into the mod commit
+    // they amend, so each mod stays one commit. --empty=drop keeps the non-interactive
+    // handling of commits upstream already contains.
+    run("git", ["rebase", "--quiet", "-i", "--autosquash", "--empty=drop", "--onto", targetSha, source.base], {
+      env: { ...process.env, GIT_SEQUENCE_EDITOR: "true", GIT_EDITOR: "true" },
+    });
   } catch {
     remaining = continueRebase();
   }
@@ -195,12 +200,13 @@ function main() {
   }
 
   // Tripwire: every commit of the stack must still be there, except ones that only
-  // touched upstream workflows.
+  // touched upstream workflows and fixups folded into their mod.
   if (remaining.length === 0) {
     const after = new Set(git("log", "--format=%s", `${targetSha}..HEAD`).split("\n"));
-    const lost = source.commits.filter(
-      (commit) => !after.has(git("log", "-1", "--format=%s", commit)) && !onlyUpstreamWorkflows(filesOf(commit)),
-    );
+    const lost = source.commits.filter((commit) => {
+      const subject = git("log", "-1", "--format=%s", commit);
+      return !/^(fixup|squash|amend)! /.test(subject) && !after.has(subject) && !onlyUpstreamWorkflows(filesOf(commit));
+    });
     if (lost.length > 0) {
       throw new Error(`the rebase lost ${lost.map((commit) => git("log", "-1", "--format=%h %s", commit)).join("; ")}`);
     }
