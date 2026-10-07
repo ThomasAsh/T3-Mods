@@ -3,8 +3,9 @@ name: Mods · Verify
 # Typechecks, tests and lints what the mod stack touches (mods/scripts/verify.mjs).
 
 on:
+  # Every branch, so a pull request shows checks whatever its branch is called.
   push:
-    branches: [main, next, "repair/**", "mod/**"]
+    branches: ["**"]
   workflow_dispatch:
     inputs:
       ref:
