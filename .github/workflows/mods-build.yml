@@ -1,13 +1,17 @@
-name: Mods · Build Windows
+name: Mods · Build
 
-# Builds the modded Windows x64 installer from a ref and publishes it as a
-# private GitHub Release. The installer carries no update feed, so the in-app
-# updater stays off and a vanilla upstream build can never replace it; the
-# local T3 Mods Updater (mods/updater) installs these releases instead.
+# Builds the modded T3 Code from a ref and publishes it as a private GitHub Release:
+#   Windows x64 installer   desktop app on Windows (T3ModsUpdater.ps1 installs it)
+#   Linux x64 AppImage      desktop app on Linux (t3-mods-updater.sh installs it)
+#   Linux x64 CLI archive   the headless server the HD/HDG containers run, so
+#                           server-side mods (the account router) apply to every
+#                           thread whichever client started it
+# Desktop builds carry no update feed, so the in-app updater stays off and a vanilla
+# upstream build can never replace them; the local updaters install these releases.
 #
-# Mirrors upstream's release split: the JS bundle builds on Linux, the
-# installer packages on Windows with the same-version upstream Linux CLI
-# archive embedded as the WSL runtime.
+# Mirrors upstream's release split: the JS bundle builds once on Linux, each platform
+# packages it on its own runner. The Windows installer embeds upstream's same-version
+# Linux CLI archive as its WSL runtime (the WSL backend runs vanilla).
 
 on:
   workflow_dispatch:
@@ -98,6 +102,8 @@ jobs:
       - name: Install browser secret helper build libraries
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
 
+      # t3#build (server bundle plus the web client in apps/server/dist) and
+      # @t3tools/desktop#build (Electron main in apps/desktop/dist-electron).
       - name: Build JS bundle
         run: vp run build:desktop
 
@@ -203,10 +209,8 @@ jobs:
               --wsl-runtime "$GITHUB_WORKSPACE/wsl-runtime/t3-${VERSION}-linux-x64.tar.gz" \
               --verbose
 
-      - name: Write release manifest
+      - name: Check installer payload
         shell: bash
-        env:
-          SHA: ${{ needs.bundle.outputs.sha }}
         run: |
           set -euo pipefail
           exe="$(ls release/*.exe | head -1)"
@@ -217,31 +221,209 @@ jobs:
             echo "::error::Installer contains an update feed; refusing to publish." && exit 1
           fi
           grep -q 'resources\\wsl-runtime.tar.gz' <<< "$payload" || { echo "::error::Installer is missing the WSL runtime." && exit 1; }
-          node mods/scripts/manifest.mjs "$exe" "$VERSION" "$UPSTREAM_TAG" "$SHA" "${{ github.run_number }}" > release/mods-manifest.json
-          cat release/mods-manifest.json
 
-      - name: Upload installer artifact
+      - name: Upload installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: installer-win-x64
-          path: |
-            release/*.exe
-            release/mods-manifest.json
+          path: release/*.exe
           if-no-files-found: error
           retention-days: 14
 
+  linux:
+    name: Package Linux x64
+    needs: bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      VERSION: ${{ needs.bundle.outputs.version }}
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          SHA: ${{ needs.bundle.outputs.sha }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=tree:0 --no-tags origin "$SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout -q --detach FETCH_HEAD
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install desktop dependencies
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor
+          key: resource-monitor-x86_64-unknown-linux-gnu-${{ hashFiles('native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Cache Linux capture helpers
+        id: capture_helper_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            native/kde-snap-shot/target/x86_64-unknown-linux-gnu/release/t3-kde-snap-shot
+            native/hyprland-snap-shot/target/x86_64-unknown-linux-gnu/release/t3-hyprland-snap-shot
+          key: linux-capture-helpers-x86_64-unknown-linux-gnu-${{ hashFiles('native/kde-snap-shot/Cargo.lock', 'native/kde-snap-shot/Cargo.toml', 'native/kde-snap-shot/src/**', 'native/hyprland-snap-shot/Cargo.lock', 'native/hyprland-snap-shot/Cargo.toml', 'native/hyprland-snap-shot/src/**', 'native/hyprland-snap-shot/protocols/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true' || steps.capture_helper_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Align package versions
+        run: node scripts/update-release-package-versions.ts "${{ env.VERSION }}"
+
+      - name: Download JS bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: js-bundle
+          path: apps
+
+      - name: Install Linux desktop build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev pkg-config imagemagick
+
+      - name: Build AppImage
+        shell: bash
+        env:
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
+          T3CODE_DESKTOP_REUSE_LINUX_CAPTURE_HELPERS: ${{ steps.capture_helper_cache.outputs.cache-hit == 'true' }}
+        run: |
+          set -euo pipefail
+          # No GITHUB_REPOSITORY means no publish config, so no app-update.yml.
+          env -u GITHUB_REPOSITORY -u T3CODE_DESKTOP_UPDATE_REPOSITORY \
+            vp run dist:desktop:artifact \
+              --platform linux --target AppImage --arch x64 \
+              --build-version "$VERSION" \
+              --skip-build \
+              --verbose
+
+      - name: Check AppImage payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          appimage="$(ls release/*.AppImage | head -1)"
+          chmod +x "$appimage"
+          (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/$appimage" --appimage-extract > /dev/null)
+          root="$RUNNER_TEMP/squashfs-root"
+          if [ -e "$root/resources/app-update.yml" ]; then
+            echo "::error::AppImage contains an update feed; refusing to publish." && exit 1
+          fi
+          cat "$root"/*.desktop
+
+      # The single-executable needs a Node that supports --build-sea; keep this in
+      # step with SEA_NODE_VERSION in apps/server/vite.config.ts.
+      - name: Build CLI single-executable
+        env:
+          VP_NODE_VERSION: "26.8.2"
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Build CLI archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          monitor="$RUNNER_TEMP/cli-resource-monitor/linux-x64"
+          mkdir -p "$monitor"
+          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor "$monitor/"
+          node scripts/build-cli-archive.ts \
+            --platform linux --arch x64 --version "$VERSION" \
+            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
+            --output-dir release-cli
+
+      - name: Smoke-test CLI archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "$VERSION"
+          # Tripwire: the server must carry the server-side mods, not upstream's build.
+          mkdir -p "$RUNNER_TEMP/cli-check"
+          tar -xzf release-cli/t3-"$VERSION"-linux-x64.tar.gz -C "$RUNNER_TEMP/cli-check"
+          grep -aq accountRoutingExcludedInstanceIds "$RUNNER_TEMP"/cli-check/*/t3 \
+            || { echo "::error::The CLI archive has no account router." && exit 1; }
+
+      - name: Upload Linux builds
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-x64
+          path: |
+            release/*.AppImage
+            release-cli/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish release
+    needs: [bundle, windows, linux]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.bundle.outputs.version }}
+      UPSTREAM_TAG: ${{ needs.bundle.outputs.upstream_tag }}
+      SHA: ${{ needs.bundle.outputs.sha }}
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=tree:0 --no-tags origin "$SHA"
+          git sparse-checkout set --no-cone '/mods/'
+          git -c checkout.workers=0 checkout -q --detach FETCH_HEAD
+
+      - name: Download Windows build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: installer-win-x64
+          path: release
+
+      - name: Download Linux builds
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: linux-x64
+          path: release
+
+      - name: Write release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          find release -type f | sort
+          node mods/scripts/manifest.mjs "$VERSION" "$UPSTREAM_TAG" "$SHA" "${{ github.run_number }}" \
+            --installer "$(find release -name '*.exe' | head -1)" \
+            --appimage "$(find release -name '*.AppImage' | head -1)" \
+            --server "$(find release -name "t3-${VERSION}-linux-x64.tar.gz" | head -1)" \
+            > mods-manifest.json
+          cat mods-manifest.json
+
       - name: Publish release
-        if: inputs.publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ needs.bundle.outputs.sha }}
         run: |
           set -euo pipefail
           tag="mods-v${VERSION}-${{ github.run_number }}"
-          exe="$(ls release/*.exe | head -1)"
-          node mods/scripts/release-notes.mjs "$UPSTREAM_TAG" "$SHA" > release/notes.md
-          gh release create "$tag" "$exe" release/mods-manifest.json mods/updater/T3ModsUpdater.ps1 \
+          node mods/scripts/release-notes.mjs "$UPSTREAM_TAG" "$SHA" > notes.md
+          gh release create "$tag" \
+            $(find release -type f \( -name '*.exe' -o -name '*.AppImage' -o -name '*.tar.gz' \)) \
+            mods-manifest.json mods/updater/T3ModsUpdater.ps1 mods/updater/t3-mods-updater.sh \
             --repo "$GITHUB_REPOSITORY" --target "$SHA" \
             --title "T3 Code ${VERSION} + mods (#${{ github.run_number }})" \
-            --notes-file release/notes.md --latest
+            --notes-file notes.md --latest
