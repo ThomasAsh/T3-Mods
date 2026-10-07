@@ -136,7 +136,7 @@ t3_pids() {
     pid="${proc#/proc/}"
     [ -O "$proc" ] || continue
     exe="$(readlink "$proc/exe" 2> /dev/null || true)"
-    appimage="$(tr '\0' '\n' < "$proc/environ" 2> /dev/null | sed -n 's/^APPIMAGE=//p' || true)"
+    appimage="$(tr '\0' '\n' 2> /dev/null < "$proc/environ" | sed -n 's/^APPIMAGE=//p' || true)"
     if [[ "${exe##*/}" == t3code ]] || [[ "${appimage,,}" == *t3* && "$appimage" == *.AppImage ]]; then
       [ "$pid" != "$$" ] && echo "$pid"
     fi
@@ -188,10 +188,11 @@ GUI_ENV=()
 capture_gui_env() {
   local pid
   for pid in "$@"; do
-    mapfile -t GUI_ENV < <(tr '\0' '\n' < "/proc/$pid/environ" 2> /dev/null \
+    mapfile -t GUI_ENV < <(tr '\0' '\n' 2> /dev/null < "/proc/$pid/environ" \
       | grep -E '^(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|XDG_CURRENT_DESKTOP|XDG_SESSION_TYPE|DESKTOP_SESSION)=' || true)
     [ "${#GUI_ENV[@]}" -gt 0 ] && return 0
   done
+  return 0
 }
 stop_t3() {
   local pids
@@ -247,13 +248,13 @@ health_check() { # health_check <started-epoch> <was-running>
 }
 backup_userdata() { # backup_userdata <label> <with-database 0|1>
   [ -d "$USERDATA" ] || return 0
-  local dest
+  local dest sub
   dest="$BACKUPS/$(date +%Y%m%d-%H%M%S)-$1"
   mkdir -p "$dest"
   find "$USERDATA" -maxdepth 1 -type f ! -name 'usage-*' -print0 | while IFS= read -r -d '' file; do
     if [ "$2" = 1 ] || [[ "$file" != *.sqlite* ]]; then cp -p "$file" "$dest/"; fi
   done
-  for dir in secrets themes; do [ -d "$USERDATA/$dir" ] && cp -rp "$USERDATA/$dir" "$dest/"; done
+  for sub in secrets themes; do [ -d "$USERDATA/$sub" ] && cp -rp "$USERDATA/$sub" "$dest/"; done
   log "backed up userdata to $dest (database: $2)"
   find "$BACKUPS" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do rm -rf "$old"; done
 }
@@ -269,10 +270,11 @@ desktop_integration() {
   [ -n "$icon" ] && cp -f "$icon" "$ICON"
   mkdir -p "$(dirname "$DESKTOP_FILE")" "$HOME/.local/bin"
   if [ -n "$entry" ]; then
-    sed -E -e "s|^Exec=AppRun|Exec=\"$APP\"|" -e "s|^Exec=[^ ]+\.AppImage|Exec=\"$APP\"|" \
-      -e "s|^Icon=.*|Icon=$ICON|" -e '/^TryExec=/d' "$entry" > "$DESKTOP_FILE"
+    # Exec=AppRun %U (or a quoted path) becomes our AppImage, keeping the arguments.
+    sed -E -e "s#^Exec=(\"[^\"]*\"|[^ ]+)#Exec=\"$APP\"#" \
+      -e "s#^Icon=.*#Icon=$ICON#" -e '/^TryExec=/d' "$entry" > "$DESKTOP_FILE"
   else
-    printf '[Desktop Entry]\nName=T3 Code\nExec="%s" --no-sandbox %%U\nIcon=%s\nType=Application\nCategories=Development;\nStartupWMClass=t3code\nMimeType=x-scheme-handler/t3code;x-scheme-handler/t3code-dev;\n' "$APP" "$ICON" > "$DESKTOP_FILE"
+    printf '[Desktop Entry]\nName=T3 Code\nExec="%s" %%U\nIcon=%s\nType=Application\nCategories=Development;\nStartupWMClass=t3code\nMimeType=x-scheme-handler/t3code;x-scheme-handler/t3code-dev;\n' "$APP" "$ICON" > "$DESKTOP_FILE"
   fi
   echo "X-T3-Mods=true" >> "$DESKTOP_FILE"
   ln -sf "$APP" "$HOME/.local/bin/t3code"
@@ -341,7 +343,7 @@ vanilla_appimages() {
   {
     local pid
     for pid in $(t3_pids); do
-      tr '\0' '\n' < "/proc/$pid/environ" 2> /dev/null | sed -n 's/^APPIMAGE=//p'
+      tr '\0' '\n' 2> /dev/null < "/proc/$pid/environ" | sed -n 's/^APPIMAGE=//p'
     done
     find "$HOME" "$HOME/Applications" "$HOME/Downloads" "$HOME/Desktop" "$HOME/AppImages" "$HOME/.local/bin" \
       "$HOME/Apps" "$HOME/bin" -maxdepth 1 -iname '*t3*.AppImage' 2> /dev/null
@@ -431,9 +433,11 @@ EOF
     systemctl --user daemon-reload
     systemctl --user enable --now t3-mods-updater.timer > /dev/null
     log "installed the t3-mods-updater systemd user timer (every 30 min and 5 min after login)"
-  else
+  elif command -v crontab > /dev/null; then
     (crontab -l 2> /dev/null | grep -v 't3-mods-updater'; echo "*/30 * * * * $SELF check > /dev/null 2>&1") | crontab -
     log "installed a crontab entry (every 30 min); no systemd user session found"
+  else
+    log "no systemd user session and no crontab: nothing will run 't3-mods-updater check' automatically"
   fi
 }
 uninstall_timer() {
@@ -442,7 +446,9 @@ uninstall_timer() {
     rm -f "$UNIT_DIR/t3-mods-updater.service" "$UNIT_DIR/t3-mods-updater.timer"
     systemctl --user daemon-reload
   fi
-  crontab -l 2> /dev/null | grep -q 't3-mods-updater' && { crontab -l | grep -v 't3-mods-updater' | crontab -; }
+  if command -v crontab > /dev/null && crontab -l 2> /dev/null | grep -q 't3-mods-updater'; then
+    crontab -l | grep -v 't3-mods-updater' | crontab -
+  fi
   return 0
 }
 
