@@ -58,15 +58,12 @@ function fetchUpstream(target) {
     "+refs/heads/main:refs/remotes/upstream/main",
     ...[...tags].map((tag) => `+refs/tags/${tag}:refs/upstream-tags/${tag}`),
   ];
-  // The clone is partial: blobs are fetched when a rebase first needs them, from the
-  // promisor remotes. origin (the fork) lacks upstream's newer objects, so upstream must
-  // be one too, or a replayed commit fails to read them (7 Oct 2026: that dropped the
-  // account router from main).
+  // Full objects, never a partial clone: a rebase that has to fetch blobs lazily can fail
+  // to read a mod's own files (only the fork has them) and replay the mod commit empty
+  // (7 and 9 Oct 2026). The tripwires in main() catch what slips through.
   if (tryGit("remote", "get-url", "upstream") === null) git("remote", "add", "upstream", UPSTREAM_URL);
   else git("remote", "set-url", "upstream", UPSTREAM_URL);
-  git("config", "remote.upstream.promisor", "true");
-  git("config", "remote.upstream.partialclonefilter", "blob:none");
-  git("fetch", "--quiet", "--filter=blob:none", "--no-tags", "upstream", ...refspecs);
+  git("fetch", "--quiet", "--no-tags", "upstream", ...refspecs);
 }
 
 /** Files a commit touches. */
@@ -209,6 +206,17 @@ function main() {
     });
     if (lost.length > 0) {
       throw new Error(`the rebase lost ${lost.map((commit) => git("log", "-1", "--format=%h %s", commit)).join("; ")}`);
+    }
+    // ...and every file the stack changes must still differ from upstream: a commit
+    // replayed without its content keeps its subject but not its changes (9 Oct 2026).
+    const codeChanges = (from, to) =>
+      git("diff", "--name-only", from, to, "--", ".", ":(exclude).github/workflows", ":(exclude)mods")
+        .split("\n")
+        .filter(Boolean);
+    const stillChanged = new Set(codeChanges(targetSha, "HEAD"));
+    const lostFiles = codeChanges(source.base, source.branch).filter((file) => !stillChanged.has(file));
+    if (lostFiles.length > 0) {
+      throw new Error(`the rebase lost the stack's changes to ${lostFiles.join(", ")}`);
     }
   }
 
