@@ -57,6 +57,19 @@ const changed = git("diff", "--name-only", "--diff-filter=d", baseSha, "HEAD")
   .filter((file) => file && !file.startsWith("mods/") && !file.startsWith(".github/"));
 
 const sourceFiles = changed.filter((file) => /\.(ts|tsx|mts|cts)$/.test(file));
+
+// Enabled code mods must show up as changed source files. An empty diff means a rebase
+// replayed them without their content, and every check below would pass with nothing
+// to check (9 Oct 2026).
+const codeMods = JSON.parse(readFileSync(join(root, "mods", "mods.json"), "utf8"))
+  .mods.filter((mod) => mod.enabled && mod.id !== "fork-hygiene")
+  .map((mod) => mod.id);
+if (codeMods.length > 0 && sourceFiles.length === 0) {
+  const message = `The stack changes no source files on ${baseLabel}, but mods.json enables ${codeMods.join(", ")}. The rebase most likely lost the mods' content.`;
+  writeFileSync(join(root, "mods", "verify-report.md"), `# Mods verify: FAIL\n\n${message}\n`);
+  console.error(message);
+  process.exit(1);
+}
 const packageDirs = [
   ...new Set(
     sourceFiles
