@@ -27,7 +27,7 @@ Each mod is one commit on top of the upstream tag, kept in the order of [`mods.j
 
 | Workflow | When | What |
 |---|---|---|
-| `mods-sync` (release) | Hourly for stable; for nightly, once a day when horizon-fleet-manager starts it at 06:30 AEST | Detects a new upstream tag on the followed channel, rebases `main`, verifies, repairs with Claude Code if needed, then builds and publishes |
+| `mods-sync` (release) | Hourly for stable; for nightly, once a day when horizon-fleet-manager starts it at 06:30 AEST. An automatic nightly start builds only between 06:25 and 06:45 AEST and once a day (tag `mods-day-<YYYYMMDD>`); `outside_window` or `force` is a person's deliberate exception | Detects a new upstream tag on the followed channel, rebases `main`, verifies, repairs with Claude Code if needed, then builds and publishes |
 | `mods-sync` (canary) | Daily, while following stable | Same against upstream `main`, pushed to `next`; never publishes |
 | `mods-verify` | Push to any branch | Typecheck, tests and lint for what the stack touches |
 | `mods-build` | On demand or from sync | Windows x64 installer, Linux x64 AppImage and Linux x64 server (CLI archive), published as one private release |
