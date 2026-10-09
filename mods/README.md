@@ -104,5 +104,6 @@ After installing, they health-check the app and roll back if the check fails. Wi
 | Secret | Used by |
 |---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | Repair step. Create it with `claude setup-token`. |
+| `T3MODS_PUSH_TOKEN` | `mods-sync` pushes to `main`, `next` and `repair/*`. A fine-grained token for this repo only, with **Contents** and **Workflows** read and write. The default `GITHUB_TOKEN` may not push commits that touch workflow files, and upstream's nightlies regularly include them. Without this secret the sync falls back to `GITHUB_TOKEN` and opens an issue when GitHub refuses the push. |
 
-`GITHUB_TOKEN` covers everything else.
+`GITHUB_TOKEN` covers everything else. To replace a secret, run `gh secret set <NAME> -R ThomasAsh/T3-Mods` and paste the value at the prompt.
