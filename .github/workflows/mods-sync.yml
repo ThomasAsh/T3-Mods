@@ -8,6 +8,11 @@ name: Mods · Sync upstream
 #            own 06:30 schedule started about four hours late on 8 and 9 Oct 2026, so it
 #            was removed (fleet decision F27). The servers take each build within minutes
 #            and the desktops after them.
+#            On nightlies an automatic start builds only between 06:25 and 06:45 AEST,
+#            by GitHub's clock, and only once a day: the first sync to publish creates
+#            the tag mods-day-<YYYYMMDD> before moving main, and a later one that day
+#            stops there (fleet decision F33). A person can step outside both with
+#            force or outside_window.
 #   canary   daily: upstream main → rebase onto `next`, verify, repair; never publishes.
 #            Skipped while following nightlies, which are already cut from main.
 # The channel comes from mods/mods.json `upstream` (see mods/scripts/upstream.mjs).
@@ -29,6 +34,10 @@ on:
         description: Rebuild and publish even when main is already on the latest tag
         type: boolean
         default: false
+      outside_window:
+        description: "A person's deliberate nightly build outside 06:25 to 06:45 AEST, or a second one the same day"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -48,6 +57,7 @@ jobs:
       mode: ${{ steps.plan.outputs.mode }}
       target: ${{ steps.plan.outputs.target }}
       needed: ${{ steps.plan.outputs.needed }}
+      day: ${{ steps.plan.outputs.day }}
     steps:
       - name: Checkout
         shell: bash
@@ -67,6 +77,7 @@ jobs:
         env:
           INPUT_MODE: ${{ inputs.mode }}
           FORCE: ${{ inputs.force }}
+          OUTSIDE_WINDOW: ${{ inputs.outside_window }}
           SCHEDULE: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
@@ -86,6 +97,21 @@ jobs:
             if [ "$channel" = "nightly" ] && [ "$SCHEDULE" = "17 * * * *" ]; then needed=false; fi
             echo "Following $channel. main is on $base; latest upstream tag is $target"
           fi
+          # F33: an automatic nightly start builds only in the morning window, once a day.
+          day=""
+          if [ "$mode" = "release" ] && [ "$channel" = "nightly" ] && [ "$needed" = "true" ] \
+            && [ -z "$SCHEDULE" ] && [ "$FORCE" != "true" ] && [ "$OUTSIDE_WINDOW" != "true" ]; then
+            hm=$((10#$(TZ=Australia/Brisbane date +%H%M)))
+            day="$(TZ=Australia/Brisbane date +%Y%m%d)"
+            if [ "$hm" -lt 625 ] || [ "$hm" -gt 645 ]; then
+              needed=false
+              echo "It is $(TZ=Australia/Brisbane date +%H:%M) AEST, outside the 06:25 to 06:45 window: no nightly build."
+            elif [ -n "$(git ls-remote --tags origin "refs/tags/mods-day-$day")" ]; then
+              needed=false
+              echo "A nightly build already ran today (mods-day-$day): no second one."
+            fi
+          fi
+          echo "day=$day" >> "$GITHUB_OUTPUT"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "target=$target" >> "$GITHUB_OUTPUT"
           echo "needed=$needed" >> "$GITHUB_OUTPUT"
@@ -101,6 +127,7 @@ jobs:
     env:
       MODE: ${{ needs.plan.outputs.mode }}
       TARGET: ${{ needs.plan.outputs.target }}
+      DAY: ${{ needs.plan.outputs.day }}
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
     steps:
       # Pushes go out with T3MODS_PUSH_TOKEN: the default token may not push commits that
@@ -198,6 +225,12 @@ jobs:
           elif [ "${{ steps.rebase.outputs.status }}" != "up-to-date" ]; then
             # Keep the previous main reachable, then move main. Forced: a failed earlier
             # attempt may have left the tag, and it must not block this push.
+            # F33: claim the day before moving main. Not forced, so of two syncs racing
+            # on the same morning only one gets past here.
+            if [ -n "$DAY" ] && ! git push -q origin "HEAD:refs/tags/mods-day-$DAY"; then
+              echo "::error::Another sync already built today (mods-day-$DAY); main is unchanged."
+              exit 1
+            fi
             git push -q --force origin "$MAIN_SHA:refs/tags/mods-pre-$TARGET"
             git push -q --force-with-lease="main:$MAIN_SHA" origin HEAD:refs/heads/main
             echo "main now carries the mod stack on $TARGET."
