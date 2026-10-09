@@ -3,7 +3,7 @@
 Personal mods for T3 Code, kept alive across upstream updates by an auto-rebasing,
 self-repairing build pipeline.
 
-Status: **confirmed 2026-10-05, updated 2026-10-07**. Decisions in section 9.
+Status: **confirmed 2026-10-05, updated 2026-10-09**. Decisions in section 9.
 
 ---
 
@@ -87,11 +87,12 @@ Shipped from v0.0.45 to the 2735 nightly, then dropped: upstream nightly's own a
 1. **Pool.** Every enabled, signed-in instance of a provider, deduplicated by config dir. New accounts join automatically; each can be switched off in Settings. Single-account providers (Codex today) are left alone.
 2. **Sticky.** A thread stays on its account while it has room, because prompt cache is per account. Never moved just to rebalance.
 3. **Failover (the main job).** When a run fails on a usage limit, the router immediately continues it on the best other account ("Continue where you left off. (Moved from HDG to EAP: HDG hit its usage limit.)"). Queued plain-text follow-ups move with it. If no account has room, upstream's resume-at-reset applies.
-4. **Before a turn starts**, an account at ≥ 90% of its 5-hour window or ≥ 97% of a weekly window (including the model's own weekly) counts as nearly full; the thread moves to a healthy account if there is one.
+4. **Before a turn starts**, an account at ≥ 90% of its 5-hour window or ≥ 97% of a weekly window (including the model's own weekly) counts as nearly full; the thread moves to a healthy account if there is one. It stays while its session still runs background subagents or monitors for the thread, since their results can't follow it, and moves once the account is out. A request for an account the thread already left counts as the thread's own: the composer remembers the old account (fixed after the first handoff, 2026-10-09).
 5. **Cheapest transfer.** The router only changes the thread's account; upstream's provider switch carries the context: a summary of ≤ 16k tokens plus thread-read pointers on the first visit to an account, and a native resume plus delta when returning to one. The destination is sticky, and the account it left counts as blocked until its reset, so there's no ping-pong.
 6. **New threads** start on the account with the most usable room: healthy first, then weekly allowance that resets within 24 h, then the most 5-hour room.
 7. **Same model always.** Never changes provider or model.
 8. **Fail-open.** Any router error dispatches the command as sent.
+9. **One config across accounts.** Pooled Claude accounts share project memory, skills and settings (each other account links to one copy), so a moved thread keeps what the other account knew.
 
 ### Where it hooks
 - One wrapper on `OrchestratorV2.dispatch` (in `runtimeLayer.ts`), so clients, MCP tools, scheduled tasks and launches all pass it.
