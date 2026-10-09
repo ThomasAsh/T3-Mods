@@ -12,12 +12,15 @@ import {
   CommandId,
   MessageId,
   type ModelSelection,
+  type OrchestrationV2Run,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2ThreadShell,
   type ProviderInstanceId,
   type ThreadId,
 } from "@t3tools/contracts";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -31,14 +34,19 @@ import { ProviderRegistry } from "../../provider/ProviderRegistry.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
+  backgroundWorkOn,
   chooseFailover,
   chooseForFollowUp,
   chooseForNewThread,
+  effectiveRequest,
   goalToCarry,
   poolContaining,
   requeueableMessages,
   routingPools,
+  strandedWakeRuns,
+  strandedWorkNote,
 } from "./accountRouter.logic.ts";
+import { shareAccountConfig } from "./sharedAccountConfig.ts";
 
 type MessageDispatch = Extract<OrchestrationV2ServerCommand, { readonly type: "message.dispatch" }>;
 
@@ -46,6 +54,13 @@ type MessageDispatch = Extract<OrchestrationV2ServerCommand, { readonly type: "m
 const FRESH_THREAD_LIMIT = 200;
 /** Fallback for limit failures the event stream missed, e.g. across a restart. */
 const SWEEP_INTERVAL = "1 minute";
+/** How often pooled accounts' user config is re-linked, e.g. for a project's first memory. */
+const SHARE_CONFIG_INTERVAL = "5 minutes";
+/** Turn items that can outlive their turn as background work. */
+const BACKGROUND_FILTER = {
+  turnItemTypes: ["subagent", "command_execution", "dynamic_tool"],
+  turnItemStatuses: ["pending", "running", "waiting"],
+} as const;
 
 const withInstance = <C extends { readonly modelSelection?: ModelSelection | undefined }>(
   command: C,
@@ -96,6 +111,28 @@ const makeRoutedOrchestrator = Effect.gen(function* () {
   const logMove = (event: string, details: Record<string, unknown>) =>
     Effect.logInfo(`t3mods.account-router.${event}`, details);
 
+  /** Cancels queued provider wakes that would pull the thread off `target`. */
+  const cancelStrandedWakes = Effect.fn("AccountRouter.cancelStrandedWakes")(function* (
+    threadId: ThreadId,
+    runs: ReadonlyArray<OrchestrationV2Run>,
+    target: ProviderInstanceId,
+  ) {
+    const queued = runs.filter((run) => run.status === "queued" && run.providerInstanceId !== target);
+    if (queued.length === 0) return;
+    const { messages } = yield* inner.getThreadRecords(threadId, ["messages"], {
+      messageIds: queued.map((run) => run.userMessageId),
+    });
+    for (const run of strandedWakeRuns({ runs: queued, messages, target })) {
+      yield* inner.dispatch({
+        type: "queued-run.cancel",
+        commandId: CommandId.make(`t3mods-wake-cancel:${run.id}`),
+        threadId,
+        runId: run.id,
+      });
+      yield* logMove("wake-cancelled", { threadId, runId: run.id, account: run.providerInstanceId });
+    }
+  });
+
   const routeMessage = Effect.fn("AccountRouter.routeMessage")(function* (command: MessageDispatch) {
     const mode = command.dispatchMode.type;
     if (
@@ -124,18 +161,60 @@ const makeRoutedOrchestrator = Effect.gen(function* () {
     }
     const shell = yield* inner.getThreadShell(command.threadId);
     if (shell === null) return command;
+    const current = pool.some((account) => account.instanceId === shell.providerInstanceId)
+      ? shell.providerInstanceId
+      : null;
+    if (current === null) {
+      const target = chooseForFollowUp({
+        pool,
+        current,
+        requested,
+        model: command.modelSelection.model,
+        nowMs: routing.nowMs,
+      });
+      if (target === requested) return command;
+      yield* logMove("follow-up", { threadId: command.threadId, from: requested, to: target });
+      return withInstance(command, command.modelSelection, target);
+    }
+    const { runs, providerThreads, turnItems } = yield* inner.getThreadRecords(
+      command.threadId,
+      ["runs", "providerThreads", "turnItems"],
+      BACKGROUND_FILTER,
+    );
+    const background = backgroundWorkOn({ account: current, runs, turnItems, providerThreads });
     const target = chooseForFollowUp({
       pool,
-      current: pool.some((account) => account.instanceId === shell.providerInstanceId)
-        ? shell.providerInstanceId
-        : null,
-      requested,
+      current,
+      requested: effectiveRequest({
+        requested,
+        current,
+        history: shell.providerInstanceHistory ?? [],
+      }),
       model: command.modelSelection.model,
       nowMs: routing.nowMs,
+      currentHasBackgroundWork: background.length > 0,
     });
-    if (target === requested) return command;
-    yield* logMove("follow-up", { threadId: command.threadId, from: requested, to: target });
-    return withInstance(command, command.modelSelection, target);
+    yield* cancelStrandedWakes(command.threadId, runs, target).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("t3mods.account-router.wake-cancel-failed", { cause }),
+      ),
+    );
+    // Equal when the client asked for an account the thread already left: it stays.
+    const moving = target !== current;
+    const fromLabel = pool.find((account) => account.instanceId === current)?.label ?? current;
+    const note = moving ? strandedWorkNote({ fromLabel, work: background }) : null;
+    if (moving && target !== requested) {
+      yield* logMove("follow-up", {
+        threadId: command.threadId,
+        from: current,
+        to: target,
+        ...(background.length === 0 ? {} : { strandedWork: background }),
+      });
+    }
+    if (target === requested && note === null) return command;
+    const routed =
+      target === requested ? command : withInstance(command, command.modelSelection, target);
+    return note === null ? routed : { ...routed, text: `${command.text}\n\n(${note})` };
   });
 
   const routeCommand = Effect.fn("AccountRouter.routeCommand")(function* (
@@ -202,6 +281,8 @@ const makeRoutedOrchestrator = Effect.gen(function* () {
     to: ProviderInstanceId,
   ) {
     const { runs } = yield* inner.getThreadRecords(threadId, ["runs"]);
+    // Wakes left on the account that ran out would only fail there and pull the thread back.
+    yield* cancelStrandedWakes(threadId, runs, to);
     const queued = runs.filter((run) => run.status === "queued");
     if (queued.length === 0) return;
     const { messages } = yield* inner.getThreadRecords(threadId, ["messages"], {
@@ -262,12 +343,21 @@ const makeRoutedOrchestrator = Effect.gen(function* () {
     });
     // No account has room: upstream's resume-at-reset (if enabled) takes over.
     if (target === null) return;
-    const { providerThreads } = yield* inner.getThreadRecords(shell.id, ["providerThreads"]);
+    const records = yield* inner.getThreadRecords(
+      shell.id,
+      ["runs", "providerThreads", "turnItems"],
+      BACKGROUND_FILTER,
+    );
     const goal = goalToCarry(
-      providerThreads.find((providerThread) => providerThread.id === run.providerThreadId)?.goal,
+      records.providerThreads.find((providerThread) => providerThread.id === run.providerThreadId)
+        ?.goal,
     );
     continuedRuns.add(runId);
     const fromLabel = pool.find((account) => account.instanceId === from)?.label ?? from;
+    const note = strandedWorkNote({
+      fromLabel,
+      work: backgroundWorkOn({ account: from, ...records }),
+    });
     const modelSelection = { ...run.modelSelection, instanceId: target.instanceId };
     // The continuation carries the context handoff, so it goes first as a plain message.
     yield* inner.dispatch({
@@ -276,7 +366,7 @@ const makeRoutedOrchestrator = Effect.gen(function* () {
       messageId: MessageId.make(`t3mods-continue:${runId}`),
       threadId: shell.id,
       manualContinuationOfRunId: runId,
-      text: `Continue where you left off. (Moved from ${fromLabel} to ${target.label}: ${fromLabel} hit its usage limit.)`,
+      text: `Continue where you left off. (Moved from ${fromLabel} to ${target.label}: ${fromLabel} hit its usage limit.${note === null ? "" : ` ${note}`})`,
       attachments: [],
       modelSelection,
       dispatchMode: { type: "start_immediately" },
@@ -332,6 +422,33 @@ const makeRoutedOrchestrator = Effect.gen(function* () {
     }).pipe(
       Effect.catchCause((cause) => Effect.logWarning("t3mods.account-router.sweep-failed", { cause })),
       Effect.repeat(Schedule.spaced(SWEEP_INTERVAL)),
+      Effect.asVoid,
+    ),
+  );
+  // Pooled Claude accounts share project memory, skills and settings, so a moved thread keeps them.
+  const reportedConfigClashes = new Set<string>();
+  const platform = yield* HostProcessPlatform;
+  yield* forkParked(
+    Effect.gen(function* () {
+      const routing = yield* loadRouting;
+      if (routing === null) return;
+      const stamp = DateTime.formatIso(DateTime.makeUnsafe(routing.nowMs)).replace(/[:.]/g, "-");
+      for (const pool of routing.pools.values()) {
+        const configDirs = pool.flatMap((account) =>
+          account.claudeConfigDir === null ? [] : [account.claudeConfigDir],
+        );
+        const changes = yield* Effect.tryPromise(() =>
+          shareAccountConfig({ configDirs, platform, stamp, reported: reportedConfigClashes }),
+        );
+        for (const change of changes) {
+          yield* Effect.logInfo("t3mods.account-router.shared-config", { change });
+        }
+      }
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("t3mods.account-router.share-config-failed", { cause }),
+      ),
+      Effect.repeat(Schedule.spaced(SHARE_CONFIG_INTERVAL)),
       Effect.asVoid,
     ),
   );

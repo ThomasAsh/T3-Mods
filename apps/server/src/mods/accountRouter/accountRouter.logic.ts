@@ -7,10 +7,15 @@
  * room; only then does it move, and only within its pool, on the same model.
  */
 import type {
+  OrchestrationV2ConversationMessage,
+  OrchestrationV2ProviderThread,
+  OrchestrationV2Run,
+  OrchestrationV2TurnItem,
   ProviderInstanceId,
   ServerProvider,
   ServerProviderUsageWindow,
 } from "@t3tools/contracts";
+import { pendingBackgroundTurnItems } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 
 /** Before a turn starts, an account this close to a limit counts as nearly full. */
 export const SESSION_RESERVE_PERCENT = 90;
@@ -27,7 +32,11 @@ export interface RoutingAccount {
   readonly windows: ReadonlyArray<ServerProviderUsageWindow>;
   /** Reset time of a usage-limit failure seen on this account, if it is still ahead. */
   readonly blockedUntilMs: number | null;
+  /** The account's Claude config dir, for sharing user config across the pool. */
+  readonly claudeConfigDir: string | null;
 }
+
+const CLAUDE_HOME_GROUP_PREFIX = "claude:home:";
 
 export type AccountHealth =
   | { readonly state: "healthy" }
@@ -61,7 +70,8 @@ export function routingPools(input: {
   const seenAccounts = new Set<string>();
   for (const provider of input.providers) {
     if (!usable(provider) || excluded.has(provider.instanceId)) continue;
-    const accountKey = `${provider.driver}:${provider.continuation?.groupKey ?? provider.instanceId}`;
+    const groupKey = provider.continuation?.groupKey;
+    const accountKey = `${provider.driver}:${groupKey ?? provider.instanceId}`;
     if (seenAccounts.has(accountKey)) continue;
     seenAccounts.add(accountKey);
     const blockedUntil = input.blockedUntilMs.get(provider.instanceId);
@@ -72,6 +82,10 @@ export function routingPools(input: {
       models: new Set(provider.models.map((model) => model.slug)),
       windows: provider.usageLimits?.windows ?? [],
       blockedUntilMs: blockedUntil !== undefined && blockedUntil > input.nowMs ? blockedUntil : null,
+      // Claude's continuation group is its resolved config dir (`ClaudeHome.ts`).
+      claudeConfigDir: groupKey?.startsWith(CLAUDE_HOME_GROUP_PREFIX)
+        ? groupKey.slice(CLAUDE_HOME_GROUP_PREFIX.length)
+        : null,
     });
     pools.set(provider.driver, pool);
   }
@@ -198,7 +212,10 @@ export function chooseForNewThread(input: {
  * thread's own, or one the user picked) is kept while it has room. Otherwise
  * the thread's current account is preferred, since its cache is warm, then the
  * best healthy account. A nearly full account with no healthy alternative is
- * kept, since it may still finish the turn.
+ * kept, since it may still finish the turn, and so is one whose session still
+ * runs background work for the thread: that work stays in the account's
+ * session, so moving would cut its results off from the thread. It moves once
+ * the account is out, when the work stops anyway.
  */
 export function chooseForFollowUp(input: {
   readonly pool: ReadonlyArray<RoutingAccount>;
@@ -206,6 +223,7 @@ export function chooseForFollowUp(input: {
   readonly requested: ProviderInstanceId;
   readonly model: string;
   readonly nowMs: number;
+  readonly currentHasBackgroundWork?: boolean;
 }): ProviderInstanceId {
   const health = (instanceId: ProviderInstanceId | null) => {
     const account = input.pool.find((candidate) => candidate.instanceId === instanceId);
@@ -215,13 +233,119 @@ export function chooseForFollowUp(input: {
   };
   const requestedHealth = health(input.requested);
   if (requestedHealth === "healthy" || requestedHealth === null) return input.requested;
-  if (input.current !== null && health(input.current) === "healthy") return input.current;
+  const currentHealth = health(input.current);
+  if (input.current !== null && currentHealth === "healthy") return input.current;
+  if (input.current !== null && input.currentHasBackgroundWork && currentHealth === "near") {
+    return input.current;
+  }
   const alternatives = input.pool.filter((account) => account.instanceId !== input.requested);
   const best = rankAccounts(alternatives, input.model, input.nowMs)[0];
   const bestHealth = best ? accountHealth(best, input.model, input.nowMs).state : null;
   if (best && bestHealth === "healthy") return best.instanceId;
   if (best && requestedHealth === "blocked" && bestHealth === "near") return best.instanceId;
   return input.requested;
+}
+
+/**
+ * Clients keep the account a thread was started on or last picked in the
+ * composer, so after the router moves a thread they keep asking for the account
+ * it left. A request for an account the thread has already left therefore
+ * means "this thread's account", or the thread would move back as soon as the
+ * old account had room again, re-reading its whole old session.
+ */
+export function effectiveRequest(input: {
+  readonly requested: ProviderInstanceId;
+  readonly current: ProviderInstanceId | null;
+  readonly history: ReadonlyArray<ProviderInstanceId>;
+}): ProviderInstanceId {
+  return input.current !== null &&
+    input.requested !== input.current &&
+    input.history.includes(input.requested)
+    ? input.current
+    : input.requested;
+}
+
+const SETTLED_RUN_STATUSES: ReadonlySet<OrchestrationV2Run["status"]> = new Set([
+  "completed",
+  "failed",
+  "interrupted",
+  "cancelled",
+  "waiting",
+]);
+
+/**
+ * Names of the work an account's session still runs for a thread after its
+ * turns ended: background subagents, monitors and commands. It lives in that
+ * account's session, so it is left behind when the thread moves.
+ */
+export function backgroundWorkOn(input: {
+  readonly account: ProviderInstanceId;
+  readonly runs: ReadonlyArray<
+    Pick<OrchestrationV2Run, "id" | "ordinal" | "status" | "providerInstanceId">
+  >;
+  readonly turnItems: ReadonlyArray<OrchestrationV2TurnItem>;
+  readonly providerThreads: ReadonlyArray<
+    Pick<OrchestrationV2ProviderThread, "providerInstanceId" | "ownerNodeId" | "pendingBackgroundTasks">
+  >;
+}): ReadonlyArray<string> {
+  const settledRunsHere = new Set<string>(
+    input.runs
+      .filter((run) => run.providerInstanceId === input.account && SETTLED_RUN_STATUSES.has(run.status))
+      .map((run) => run.id),
+  );
+  const names = new Set<string>();
+  for (const item of pendingBackgroundTurnItems({ turnItems: input.turnItems, runs: input.runs })) {
+    if (item.runId != null && settledRunsHere.has(item.runId)) {
+      names.add(item.title?.trim() || item.type.replace("_", " "));
+    }
+  }
+  for (const providerThread of input.providerThreads) {
+    if (providerThread.ownerNodeId !== null || providerThread.providerInstanceId !== input.account) {
+      continue;
+    }
+    for (const task of providerThread.pendingBackgroundTasks ?? []) {
+      names.add(task.description?.trim() || task.kind.replace("_", " "));
+    }
+  }
+  return [...names];
+}
+
+/** What the thread is told when it leaves background work behind on the account it left. */
+export function strandedWorkNote(input: {
+  readonly fromLabel: string;
+  readonly work: ReadonlyArray<string>;
+}): string | null {
+  if (input.work.length === 0) return null;
+  const shown = input.work.slice(0, 5).map((name) => `"${name}"`);
+  const more = input.work.length > shown.length ? ` and ${input.work.length - shown.length} more` : "";
+  return `Background work was still running on ${input.fromLabel} and stopped there; its results won't come back here: ${shown.join(", ")}${more}. Check what it finished before redoing it.`;
+}
+
+/**
+ * Queued provider wakes ("Background task completed.") for an account other
+ * than the one the thread runs on next. A wake keeps the account it was queued
+ * on, so starting it would move the thread back there and stop the session it
+ * moved to. While background work runs, a thread only leaves an account that is
+ * out of room, so such a wake could only fail.
+ */
+export function strandedWakeRuns<
+  Run extends Pick<OrchestrationV2Run, "status" | "providerInstanceId" | "userMessageId">,
+>(input: {
+  readonly runs: ReadonlyArray<Run>;
+  readonly messages: ReadonlyArray<
+    Pick<OrchestrationV2ConversationMessage, "id" | "creationSource" | "notification">
+  >;
+  readonly target: ProviderInstanceId;
+}): ReadonlyArray<Run> {
+  return input.runs.filter((run) => {
+    if (run.status !== "queued" || run.providerInstanceId === input.target) return false;
+    const message = input.messages.find((candidate) => candidate.id === run.userMessageId);
+    return (
+      message?.creationSource === "provider" &&
+      message.notification !== undefined &&
+      message.notification.source.kind !== "delegated_task"
+    );
+  });
 }
 
 /** Where a run that hit a usage limit on `from` continues, or null to wait for the reset. */

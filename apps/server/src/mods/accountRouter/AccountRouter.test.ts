@@ -146,6 +146,8 @@ const makeRouter = (input: {
     readonly id: string;
     readonly goal: { readonly objective: string; readonly status: string } | null;
   }>;
+  readonly turnItems?: ReadonlyArray<Record<string, unknown>>;
+  readonly messages?: ReadonlyArray<Record<string, unknown>>;
   readonly routingEnabled?: boolean;
 }) =>
   Effect.gen(function* () {
@@ -175,12 +177,13 @@ const makeRouter = (input: {
           threads: shells,
           archivedThreads: [],
         }),
-      // Only the records the router reads: runs, provider threads, and no queued messages.
+      // Only the records the router reads; filters are left to the projection store.
       getThreadRecords: <K extends ProjectionRecordField>(threadId: ThreadId) =>
         Effect.succeed({
           runs: runs.filter((run) => run.threadId === threadId),
           providerThreads: input.providerThreads ?? [],
-          messages: [],
+          turnItems: input.turnItems ?? [],
+          messages: input.messages ?? [],
         } as unknown as ProjectionRecords<K>),
       streamDomainEvents: Stream.empty,
     });
@@ -314,6 +317,97 @@ describe("AccountRouter", () => {
       yield* router.dispatch(message("busy", HDG));
       const [sent] = dispatched;
       assert.strictEqual(sent?.type === "message.dispatch" && sent.modelSelection?.instanceId, EAP);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps a moved thread where it is when its client still asks for the old account", () =>
+    Effect.gen(function* () {
+      const { router, dispatched } = yield* makeRouter({
+        providers: [provider(HDG, 30), provider(EAP, 5)],
+        shells: [shell("moved", { providerInstanceHistory: [EAP, HDG] })],
+      });
+      yield* router.dispatch(message("moved", EAP));
+      const [sent] = dispatched;
+      assert.strictEqual(sent?.type === "message.dispatch" && sent.modelSelection?.instanceId, HDG);
+    }).pipe(Effect.scoped),
+  );
+
+  const backgroundRun = (threadId: string): OrchestrationV2Run => ({
+    ...failedRun(threadId, HDG),
+    status: "completed",
+  });
+  const backgroundSubagent = (threadId: string) => ({
+    id: `${threadId}-subagent`,
+    type: "subagent",
+    status: "running",
+    title: "Artwork for every event",
+    runId: RunId.make(`${threadId}-run`),
+  });
+
+  it.effect("stays on a nearly full account while a subagent runs there in the background", () =>
+    Effect.gen(function* () {
+      const { router, dispatched } = yield* makeRouter({
+        providers: [provider(HDG, 93), provider(EAP, 30)],
+        shells: [shell("background")],
+        runs: [backgroundRun("background")],
+        turnItems: [backgroundSubagent("background")],
+      });
+      yield* router.dispatch(message("background", HDG));
+      const [sent] = dispatched;
+      assert.strictEqual(sent?.type === "message.dispatch" && sent.modelSelection?.instanceId, HDG);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("tells the next account what background work stayed on one that ran out", () =>
+    Effect.gen(function* () {
+      const { router, dispatched } = yield* makeRouter({
+        providers: [provider(HDG, 100), provider(EAP, 30)],
+        shells: [shell("stranded")],
+        runs: [backgroundRun("stranded")],
+        turnItems: [backgroundSubagent("stranded")],
+      });
+      yield* router.dispatch(message("stranded", HDG));
+      const [sent] = dispatched;
+      assert.strictEqual(sent?.type, "message.dispatch");
+      if (sent?.type !== "message.dispatch") return;
+      assert.strictEqual(sent.modelSelection?.instanceId, EAP);
+      assert.include(sent.text, "Next step\n\n(Background work was still running on HDG");
+      assert.include(sent.text, '"Artwork for every event"');
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("cancels a background wake queued for an account the thread left", () =>
+    Effect.gen(function* () {
+      const { router, dispatched } = yield* makeRouter({
+        providers: [provider(HDG, 30), provider(EAP, 5)],
+        shells: [shell("woken", { providerInstanceHistory: [EAP, HDG] })],
+        runs: [
+          {
+            ...failedRun("woken", EAP),
+            id: RunId.make("wake-run"),
+            status: "queued",
+            userMessageId: MessageId.make("wake-message"),
+          },
+        ],
+        messages: [
+          {
+            id: MessageId.make("wake-message"),
+            creationSource: "provider",
+            notification: { source: { kind: "subagent" }, outcome: "completed", summary: "Done" },
+          },
+        ],
+      });
+      yield* router.dispatch(message("woken", HDG));
+      assert.deepStrictEqual(
+        dispatched.map((command) =>
+          command.type === "queued-run.cancel"
+            ? `cancel ${command.runId}`
+            : command.type === "message.dispatch"
+              ? `message on ${command.modelSelection?.instanceId}`
+              : command.type,
+        ),
+        ["cancel wake-run", `message on ${HDG}`],
+      );
     }).pipe(Effect.scoped),
   );
 
