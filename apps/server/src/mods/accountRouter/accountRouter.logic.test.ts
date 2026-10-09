@@ -9,13 +9,17 @@ import * as DateTime from "effect/DateTime";
 
 import {
   accountHealth,
+  backgroundWorkOn,
   chooseFailover,
   chooseForFollowUp,
   chooseForNewThread,
+  effectiveRequest,
   goalToCarry,
   rankAccounts,
   requeueableMessages,
   routingPools,
+  strandedWakeRuns,
+  strandedWorkNote,
   windowAppliesToModel,
   type RoutingAccount,
 } from "./accountRouter.logic.ts";
@@ -53,6 +57,7 @@ const account = (
   models: new Set([OPUS]),
   windows,
   blockedUntilMs: null,
+  claudeConfigDir: null,
   ...overrides,
 });
 
@@ -122,6 +127,22 @@ describe("routingPools", () => {
       nowMs: NOW,
     });
     assert.strictEqual(withoutEap.size, 0);
+  });
+
+  it("reads each Claude account's config dir from its continuation group", () => {
+    const pools = routingPools({
+      providers: [
+        provider(HDG, { continuation: { groupKey: "claude:home:/home/t3/.claude" } }),
+        provider(EAP, { continuation: { groupKey: "acp:other" } }),
+      ],
+      excludedInstanceIds: [],
+      blockedUntilMs: new Map(),
+      nowMs: NOW,
+    });
+    assert.deepStrictEqual(
+      pools.get("claudeAgent")?.map((entry) => entry.claudeConfigDir),
+      ["/home/t3/.claude", null],
+    );
   });
 
   it("keeps a recorded limit only while its reset is ahead", () => {
@@ -291,6 +312,141 @@ describe("chooseForFollowUp", () => {
     assert.strictEqual(
       chooseForFollowUp({ pool, current: HDG, requested: codex, model: OPUS, nowMs: NOW }),
       codex,
+    );
+  });
+
+  it("stays on a nearly full account while its session runs background work", () => {
+    const pool = [account(HDG, [session(93)]), account(EAP, [session(40)])];
+    const follow = (currentHasBackgroundWork: boolean) =>
+      chooseForFollowUp({
+        pool,
+        current: HDG,
+        requested: HDG,
+        model: OPUS,
+        nowMs: NOW,
+        currentHasBackgroundWork,
+      });
+    assert.strictEqual(follow(true), HDG);
+    assert.strictEqual(follow(false), EAP);
+  });
+
+  it("leaves an account that is out, background work or not", () => {
+    const pool = [account(HDG, [session(100)]), account(EAP, [session(40)])];
+    assert.strictEqual(
+      chooseForFollowUp({
+        pool,
+        current: HDG,
+        requested: HDG,
+        model: OPUS,
+        nowMs: NOW,
+        currentHasBackgroundWork: true,
+      }),
+      EAP,
+    );
+  });
+});
+
+describe("effectiveRequest", () => {
+  it("reads a request for an account the thread left as the thread's own", () => {
+    assert.strictEqual(
+      effectiveRequest({ requested: EAP, current: HDG, history: [EAP, HDG] }),
+      HDG,
+    );
+  });
+
+  it("keeps a pick of an account the thread never used", () => {
+    assert.strictEqual(
+      effectiveRequest({ requested: THIRD, current: HDG, history: [EAP, HDG] }),
+      THIRD,
+    );
+    assert.strictEqual(effectiveRequest({ requested: EAP, current: null, history: [EAP] }), EAP);
+  });
+});
+
+describe("backgroundWorkOn", () => {
+  const run = (id: string, providerInstanceId: ProviderInstanceId, status: string) =>
+    ({ id, ordinal: 1, status, providerInstanceId }) as unknown as Parameters<
+      typeof backgroundWorkOn
+    >[0]["runs"][number];
+  const item = (title: string, runId: string, status = "running", type = "subagent") =>
+    ({ id: `item-${title}`, type, status, title, runId }) as unknown as Parameters<
+      typeof backgroundWorkOn
+    >[0]["turnItems"][number];
+
+  it("names work still running after its turn on the account", () => {
+    const work = backgroundWorkOn({
+      account: EAP,
+      runs: [
+        run("done-eap", EAP, "completed"),
+        run("active-eap", EAP, "running"),
+        run("done-hdg", HDG, "completed"),
+      ],
+      turnItems: [
+        item("Artwork for every event", "done-eap"),
+        item("Finished helper", "done-eap", "completed"),
+        item("Foreground helper", "active-eap"),
+        item("Other account's helper", "done-hdg"),
+      ],
+      providerThreads: [
+        {
+          providerInstanceId: EAP,
+          ownerNodeId: null,
+          pendingBackgroundTasks: [{ taskId: "b1", description: "Wait for the matrix", kind: "command" }],
+        },
+        {
+          providerInstanceId: EAP,
+          ownerNodeId: "subagent-node" as never,
+          pendingBackgroundTasks: [{ taskId: "b2", description: "Subagent's own task", kind: "command" }],
+        },
+      ],
+    });
+    assert.deepStrictEqual(work, ["Artwork for every event", "Wait for the matrix"]);
+  });
+});
+
+describe("strandedWorkNote", () => {
+  it("lists what stays behind, up to five", () => {
+    assert.isNull(strandedWorkNote({ fromLabel: "EAP", work: [] }));
+    const note = strandedWorkNote({ fromLabel: "EAP", work: ["a", "b", "c", "d", "e", "f", "g"] });
+    assert.include(note ?? "", "EAP and stopped there");
+    assert.include(note ?? "", '"e" and 2 more');
+  });
+});
+
+describe("strandedWakeRuns", () => {
+  const run = (id: string, providerInstanceId: ProviderInstanceId, status = "queued") => ({
+    id,
+    status: status as "queued",
+    providerInstanceId,
+    userMessageId: `message-${id}` as never,
+  });
+  const wake = (id: string, kind = "subagent") => ({
+    id: `message-${id}` as never,
+    creationSource: "provider" as const,
+    notification: { source: { kind }, outcome: "completed", summary: "done" } as never,
+  });
+
+  it("drops provider wakes queued for an account other than the next one", () => {
+    const stranded = strandedWakeRuns({
+      runs: [
+        run("old-wake", EAP),
+        run("new-wake", HDG),
+        run("old-message", EAP),
+        run("old-task-result", EAP),
+        run("ran", EAP, "completed"),
+      ],
+      messages: [
+        wake("old-wake"),
+        wake("new-wake"),
+        { id: "message-old-message" as never, creationSource: "web" as const, notification: undefined },
+        wake("old-task-result", "delegated_task"),
+        wake("ran"),
+      ],
+      target: HDG,
+    });
+    assert.deepStrictEqual(
+      stranded.map((candidate) => candidate.id),
+      ["old-wake"],
     );
   });
 });
