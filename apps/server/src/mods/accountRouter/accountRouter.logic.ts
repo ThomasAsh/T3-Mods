@@ -9,9 +9,11 @@
 import type {
   OrchestrationV2ConversationMessage,
   OrchestrationV2ProviderThread,
+  OrchestrationV2ProviderTurn,
   OrchestrationV2Run,
   OrchestrationV2TurnItem,
   ProviderInstanceId,
+  ProviderThreadId,
   ServerProvider,
   ServerProviderUsageWindow,
 } from "@t3tools/contracts";
@@ -346,6 +348,71 @@ export function strandedWakeRuns<
       message.notification.source.kind !== "delegated_task"
     );
   });
+}
+
+/** A cold context this large costs more to re-read than a summary (upstream offers `/compact` from here). */
+const COLD_CONVERSATION_TOKENS = 100_000;
+/** Cache lifetime when the provider reported none: Claude's 1h cache plus slack, as upstream's meter uses. */
+const FALLBACK_CACHE_TTL_MS = 70 * 60 * 1000;
+/** Upstream's handoff cap; a return visit also keeps a quarter of the window free (`handoffBudget`). */
+const HANDOFF_TOKENS = 16_000;
+
+/**
+ * Conversations a move onto `target` should not resume. Upstream returns a
+ * thread to its old conversation on that account and adds only what it
+ * missed, but the provider re-reads that conversation whole. Once its prompt
+ * cache has expired, a large one costs more than a fresh start with a summary.
+ * One that is nearly full has no room for what it missed, so the turn fails
+ * (12 Oct 2026: 941k of 1M tokens, three days cold).
+ */
+export function conversationsToRetire(input: {
+  readonly target: ProviderInstanceId;
+  readonly providerThreads: ReadonlyArray<
+    Pick<
+      OrchestrationV2ProviderThread,
+      "id" | "providerInstanceId" | "ownerNodeId" | "nativeThreadRef" | "contextUsage"
+    >
+  >;
+  readonly providerTurns: ReadonlyArray<
+    Pick<OrchestrationV2ProviderTurn, "providerThreadId" | "tokenUsage">
+  >;
+  readonly nowMs: number;
+}): ReadonlyArray<ProviderThreadId> {
+  return input.providerThreads
+    .filter((providerThread) => {
+      if (
+        providerThread.providerInstanceId !== input.target ||
+        providerThread.ownerNodeId !== null ||
+        providerThread.nativeThreadRef === null
+      ) {
+        return false;
+      }
+      // The latest turn report: the thread's own snapshot can lag behind it.
+      let report: OrchestrationV2ProviderTurn["tokenUsage"];
+      for (const turn of input.providerTurns) {
+        if (
+          turn.providerThreadId === providerThread.id &&
+          turn.tokenUsage &&
+          (!report || turn.tokenUsage.updatedAt > report.updatedAt)
+        ) {
+          report = turn.tokenUsage;
+        }
+      }
+      const used = report?.usedTokens ?? providerThread.contextUsage?.usedTokens ?? 0;
+      const window = Math.min(
+        report?.maxTokens || (providerThread.contextUsage?.maxTokens ?? Infinity),
+        providerThread.contextUsage?.autoCompactThreshold ?? Infinity,
+      );
+      const full =
+        Number.isFinite(window) &&
+        used + Math.max(HANDOFF_TOKENS, Math.ceil(window / 4)) + HANDOFF_TOKENS > window;
+      const reportedAtMs = report ? Date.parse(report.updatedAt) : Number.NaN;
+      const cold =
+        !Number.isFinite(reportedAtMs) ||
+        input.nowMs - reportedAtMs >= (report?.promptCacheTtlMs ?? FALLBACK_CACHE_TTL_MS);
+      return full || (cold && used >= COLD_CONVERSATION_TOKENS);
+    })
+    .map((providerThread) => providerThread.id);
 }
 
 /** Where a run that hit a usage limit on `from` continues, or null to wait for the reset. */

@@ -130,6 +130,7 @@ import {
   ThreadForkServiceV2,
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
+import { isRetiredConversation } from "../mods/accountRouter/retiredConversations.ts"; // t3-mods: account-router
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 export class OrchestratorDispatchError extends Schema.TaggedError<OrchestratorDispatchError>()(
@@ -772,7 +773,9 @@ function rootProviderThreadsForProvider(
       (providerThread) =>
         providerThread.providerInstanceId === providerInstanceId &&
         providerThread.appThreadId === projection.thread.id &&
-        providerThread.ownerNodeId === null,
+        providerThread.ownerNodeId === null &&
+        // t3-mods: account-router — a retired conversation is not resumed; the switch starts a new one.
+        !isRetiredConversation(providerThread.id),
     )
     .toSorted(
       (left, right) =>
