@@ -5,8 +5,9 @@
  * scheduled tasks) passes one placement step, and continues runs that hit a
  * usage limit on another account of the same provider. Placement only rewrites
  * `modelSelection.instanceId`; the orchestrator's own provider switch then
- * carries the context (a summary on first visit, a delta on return). Routing
- * fails open: an error dispatches the command as sent.
+ * carries the context (a summary on first visit, a delta on return, or a
+ * summary again when the router retired a cold or full old conversation).
+ * Routing fails open: an error dispatches the command as sent.
  */
 import {
   CommandId,
@@ -38,6 +39,7 @@ import {
   chooseFailover,
   chooseForFollowUp,
   chooseForNewThread,
+  conversationsToRetire,
   effectiveRequest,
   goalToCarry,
   poolContaining,
@@ -46,6 +48,7 @@ import {
   strandedWakeRuns,
   strandedWorkNote,
 } from "./accountRouter.logic.ts";
+import { retireConversation } from "./retiredConversations.ts";
 import { shareAccountConfig } from "./sharedAccountConfig.ts";
 
 type MessageDispatch = Extract<OrchestrationV2ServerCommand, { readonly type: "message.dispatch" }>;
@@ -139,6 +142,31 @@ const makeRoutedOrchestrator = Effect.gen(function* () {
     }
   });
 
+  /**
+   * A move onto `target` starts a new conversation there instead of resuming one
+   * that is cold and large, or full. Fails open: the move itself still happens.
+   */
+  const retireStaleConversations = (threadId: ThreadId, target: ProviderInstanceId, nowMs: number) =>
+    Effect.gen(function* () {
+      const { providerThreads, providerTurns } = yield* inner.getThreadRecords(threadId, [
+        "providerThreads",
+        "providerTurns",
+      ]);
+      for (const providerThreadId of conversationsToRetire({
+        target,
+        providerThreads,
+        providerTurns,
+        nowMs,
+      })) {
+        retireConversation(providerThreadId);
+        yield* logMove("conversation-retired", { threadId, account: target, providerThreadId });
+      }
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("t3mods.account-router.retire-failed", { threadId, cause }),
+      ),
+    );
+
   const routeMessage = Effect.fn("AccountRouter.routeMessage")(function* (
     command: MessageDispatch,
   ) {
@@ -219,6 +247,7 @@ const makeRoutedOrchestrator = Effect.gen(function* () {
         ...(background.length === 0 ? {} : { strandedWork: background }),
       });
     }
+    if (moving) yield* retireStaleConversations(command.threadId, target, routing.nowMs);
     if (target === requested && note === null) return command;
     const routed =
       target === requested ? command : withInstance(command, command.modelSelection, target);
@@ -371,6 +400,7 @@ const makeRoutedOrchestrator = Effect.gen(function* () {
       work: backgroundWorkOn({ account: from, ...records }),
     });
     const modelSelection = { ...run.modelSelection, instanceId: target.instanceId };
+    yield* retireStaleConversations(shell.id, target.instanceId, routing.nowMs);
     // The continuation carries the context handoff, so it goes first as a plain message.
     yield* inner.dispatch({
       type: "message.dispatch",

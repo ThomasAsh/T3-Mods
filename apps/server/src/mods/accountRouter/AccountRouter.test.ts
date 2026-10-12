@@ -28,6 +28,7 @@ import type {
 import { ProviderRegistry } from "../../provider/ProviderRegistry.ts";
 import { layerTest as serverSettingsLayerTest } from "../../serverSettings.ts";
 import { withAccountRouter } from "./AccountRouter.ts";
+import { isRetiredConversation } from "./retiredConversations.ts";
 
 const OPUS = "claude-opus-5-5";
 const HDG = ProviderInstanceId.make("claudeAgent");
@@ -142,10 +143,8 @@ const makeRouter = (input: {
   readonly providers: ReadonlyArray<ServerProvider>;
   readonly shells?: ReadonlyArray<OrchestrationV2ThreadShell>;
   readonly runs?: ReadonlyArray<OrchestrationV2Run>;
-  readonly providerThreads?: ReadonlyArray<{
-    readonly id: string;
-    readonly goal: { readonly objective: string; readonly status: string } | null;
-  }>;
+  readonly providerThreads?: ReadonlyArray<Record<string, unknown>>;
+  readonly providerTurns?: ReadonlyArray<Record<string, unknown>>;
   readonly turnItems?: ReadonlyArray<Record<string, unknown>>;
   readonly messages?: ReadonlyArray<Record<string, unknown>>;
   readonly routingEnabled?: boolean;
@@ -182,6 +181,7 @@ const makeRouter = (input: {
         Effect.succeed({
           runs: runs.filter((run) => run.threadId === threadId),
           providerThreads: input.providerThreads ?? [],
+          providerTurns: input.providerTurns ?? [],
           turnItems: input.turnItems ?? [],
           messages: input.messages ?? [],
         } as unknown as ProjectionRecords<K>),
@@ -264,6 +264,34 @@ describe("AccountRouter", () => {
         (sent) => sent.type === "message.dispatch" && sent.manualContinuationOfRunId !== undefined,
       );
       assert.isTrue(continuation >= 0 && continuation < dispatched.indexOf(command));
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("starts a new conversation on an account whose old one went cold", () =>
+    Effect.gen(function* () {
+      const old = (id: string, instanceId: ProviderInstanceId) => ({
+        id,
+        providerInstanceId: instanceId,
+        ownerNodeId: null,
+        nativeThreadRef: { nativeId: `native-${id}` },
+        contextUsage: { usedTokens: 941_390, maxTokens: 1_000_000 },
+        goal: null,
+      });
+      const { continued } = yield* makeRouter({
+        providers: [provider(HDG, 100), provider(EAP, 20)],
+        shells: [limitedShell("returning")],
+        runs: [failedRun("returning", HDG)],
+        providerThreads: [old("returning-on-eap", EAP), old("returning-on-hdg", HDG)],
+        providerTurns: [
+          {
+            providerThreadId: "returning-on-eap",
+            tokenUsage: { usedTokens: 941_390, updatedAt: "2026-10-03T00:00:00.000Z" },
+          },
+        ],
+      });
+      yield* Deferred.await(continued);
+      assert.isTrue(isRetiredConversation("returning-on-eap"));
+      assert.isFalse(isRetiredConversation("returning-on-hdg"));
     }).pipe(Effect.scoped),
   );
 

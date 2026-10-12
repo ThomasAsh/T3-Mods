@@ -13,6 +13,7 @@ import {
   chooseFailover,
   chooseForFollowUp,
   chooseForNewThread,
+  conversationsToRetire,
   effectiveRequest,
   goalToCarry,
   rankAccounts,
@@ -447,6 +448,94 @@ describe("strandedWakeRuns", () => {
     assert.deepStrictEqual(
       stranded.map((candidate) => candidate.id),
       ["old-wake"],
+    );
+  });
+});
+
+describe("conversationsToRetire", () => {
+  const MINUTE = 60 * 1000;
+  const conversation = (
+    id: string,
+    usedTokens: number,
+    overrides: Record<string, unknown> = {},
+  ) => ({
+    id: id as never,
+    providerInstanceId: EAP,
+    ownerNodeId: null,
+    nativeThreadRef: { nativeId: `native-${id}` } as never,
+    contextUsage: { usedTokens, maxTokens: 1_000_000 },
+    ...overrides,
+  });
+  const report = (id: string, usedTokens: number, ageMs: number, promptCacheTtlMs?: number) => ({
+    providerThreadId: id as never,
+    tokenUsage: {
+      usedTokens,
+      maxTokens: 1_000_000,
+      updatedAt: iso(NOW - ageMs),
+      ...(promptCacheTtlMs === undefined ? {} : { promptCacheTtlMs }),
+    },
+  });
+  const retire = (
+    providerThreads: ReadonlyArray<ReturnType<typeof conversation>>,
+    providerTurns: ReadonlyArray<ReturnType<typeof report>>,
+  ): ReadonlyArray<string> =>
+    conversationsToRetire({ target: EAP, providerThreads, providerTurns, nowMs: NOW });
+
+  it("retires a large conversation whose cache has expired", () => {
+    assert.deepStrictEqual(
+      retire([conversation("cold", 941_390)], [report("cold", 941_390, 3 * 24 * HOUR, HOUR)]),
+      ["cold"],
+    );
+  });
+
+  it("resumes a large conversation while its cache is warm", () => {
+    assert.deepStrictEqual(
+      retire([conversation("warm", 400_000)], [report("warm", 400_000, 20 * MINUTE, HOUR)]),
+      [],
+    );
+  });
+
+  it("resumes a small conversation even when its cache has expired", () => {
+    assert.deepStrictEqual(
+      retire([conversation("small", 40_000)], [report("small", 40_000, 2 * HOUR, 5 * MINUTE)]),
+      [],
+    );
+  });
+
+  it("retires a warm conversation with no room for what it missed", () => {
+    assert.deepStrictEqual(
+      retire([conversation("full", 900_000)], [report("full", 900_000, 2 * MINUTE, HOUR)]),
+      ["full"],
+    );
+  });
+
+  it("measures by the latest turn report, not a lagging snapshot", () => {
+    assert.deepStrictEqual(
+      retire(
+        [conversation("compacted", 941_390), conversation("grown", 7_422)],
+        [
+          report("compacted", 941_390, 3 * HOUR),
+          report("compacted", 7_422, 2 * HOUR),
+          report("grown", 7_422, 3 * HOUR),
+          report("grown", 300_000, 2 * HOUR),
+        ],
+      ),
+      ["grown"],
+    );
+  });
+
+  it("only touches the target account's own top-level native conversations", () => {
+    const old = (id: string) => report(id, 941_390, 3 * 24 * HOUR);
+    assert.deepStrictEqual(
+      retire(
+        [
+          conversation("other-account", 941_390, { providerInstanceId: HDG }),
+          conversation("subagent", 941_390, { ownerNodeId: "node" }),
+          conversation("never-started", 941_390, { nativeThreadRef: null }),
+        ],
+        [old("other-account"), old("subagent"), old("never-started")],
+      ),
+      [],
     );
   });
 });
