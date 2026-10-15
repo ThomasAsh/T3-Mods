@@ -1,7 +1,13 @@
-import { ProviderInstanceId } from "@t3tools/contracts";
+import { resolvePendingHandoff } from "@t3tools/client-runtime/handoff";
+import {
+  ProviderInstanceId,
+  RunId,
+  type ModelSelection,
+  type OrchestrationV2ThreadProjection,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { routedComposerInstance } from "./routedComposerInstance";
+import { routedComposerInstance, routedPreviewSelection } from "./routedComposerInstance";
 
 const HDG = ProviderInstanceId.make("claudeAgent");
 const EAP = ProviderInstanceId.make("claudeAgent_eap");
@@ -31,5 +37,51 @@ describe("routedComposerInstance", () => {
     expect(
       routedComposerInstance({ draftInstanceId: EAP, thread: movedThread, routingActive: false }),
     ).toBe(EAP);
+  });
+});
+
+describe("routedPreviewSelection", () => {
+  const savedEap: ModelSelection = { instanceId: EAP, model: "claude-opus-5-5" };
+  const savedThird: ModelSelection = { instanceId: THIRD, model: "claude-opus-5-5" };
+  /** The moved thread's latest run, on HDG. */
+  const projection = {
+    runs: [
+      {
+        id: RunId.make("latest"),
+        ordinal: 2,
+        providerInstanceId: HDG,
+        modelSelection: movedThread.modelSelection,
+        status: "completed",
+        startedAt: "2026-10-15T00:00:00Z",
+      },
+    ],
+  } as unknown as OrchestrationV2ThreadProjection;
+  const preview = (saved: ModelSelection) =>
+    resolvePendingHandoff(
+      projection,
+      routedPreviewSelection(
+        saved,
+        routedComposerInstance({
+          draftInstanceId: saved.instanceId,
+          thread: movedThread,
+          routingActive: true,
+        }),
+      ) ?? movedThread.modelSelection,
+      [],
+    );
+
+  it("previews no handoff when the saved pick is an account the thread left", () => {
+    expect(resolvePendingHandoff(projection, savedEap, [])).not.toBeNull();
+    expect(preview(savedEap)).toBeNull();
+  });
+
+  it("still previews a handoff to an account the thread never used", () => {
+    expect(preview(savedThird)?.to).toEqual({ instanceId: THIRD, model: "claude-opus-5-5" });
+  });
+
+  it("passes the saved selection through when the router keeps it", () => {
+    expect(routedPreviewSelection(savedThird, THIRD)).toBe(savedThird);
+    expect(routedPreviewSelection(savedEap, null)).toBe(savedEap);
+    expect(routedPreviewSelection(null, HDG)).toBeNull();
   });
 });
